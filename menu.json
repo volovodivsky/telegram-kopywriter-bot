@@ -1,0 +1,117 @@
+{
+  "directions": [
+    {
+      "id": "smm",
+      "name": "SMM",
+      "enabled": true,
+      "base_skill": "skills/base/vychytka-tekstiv.md",
+      "projects": [
+        {
+          "id": "oldi",
+          "name": "ОЛДІ",
+          "skill": "skills/smm/kopyrayter-oldi.md"
+        },
+        {
+          "id": "smc",
+          "name": "СМЦ",
+          "skill": "skills/smm/kopirayter-smc.md"
+        }
+      ],
+      "tasks": [
+        {
+          "id": "check",
+          "name": "Вичитка наявного тексту",
+          "skill": "skills/tasks/smm-vychytka.md",
+          "card": true,
+          "hint": "Надішліть текст, який треба вичитати. Довгий текст можна кількома повідомленнями поспіль."
+        },
+        {
+          "id": "stories",
+          "name": "Текст для сторіс",
+          "skill": "skills/tasks/smm-storis.md",
+          "hint": "Опишіть завдання: тема або акція, мета (сайт, візит, запис…), умови акції (відсоток, дати, категорії), скільки кадрів."
+        },
+        {
+          "id": "post",
+          "name": "Текст для допису",
+          "variants": [
+            {
+              "id": "static",
+              "name": "Статика",
+              "skill": "skills/tasks/smm-dopys.md",
+              "hint": "Опишіть завдання: тема, рубрика, мета, Instagram чи Facebook, умови акції, якщо це акція. Якщо є текст банера — додайте його."
+            },
+            {
+              "id": "reels",
+              "name": "Reels",
+              "skill": "skills/tasks/smm-pid-reels.md",
+              "hint": "🎬 Надішліть сценарій Reels — я напишу текст для допису на його основі.\nНемає сценарію? Опишіть, про що ролик і хто в кадрі. Додайте мету публікації й Instagram чи Facebook."
+            }
+          ]
+        },
+        {
+          "id": "carousel",
+          "name": "Текст для каруселі",
+          "skill": "skills/tasks/smm-karusel.md",
+          "hint": "Опишіть завдання: тема, рубрика, мета, скільки слайдів, Instagram чи Facebook, умови акції, якщо це акція."
+        }
+      ]
+    },
+    {
+      "id": "target",
+      "name": "Target",
+      "enabled": false,
+      "base_skill": "skills/base/vychytka-tekstiv.md",
+      "projects": [],
+      "tasks": [
+        {
+          "id": "check",
+          "name": "Вичитка наявного тексту",
+          "skill": null,
+          "card": true,
+          "hint": "Надішліть текст, який треба вичитати."
+        },
+        {
+          "id": "script",
+          "name": "Написання сценарію",
+          "skill": null,
+          "hint": "Опишіть завдання для сценарію."
+        },
+        {
+          "id": "tz",
+          "name": "ТЗ для дизайнера під банер",
+          "skill": null,
+          "hint": "Опишіть банер: акція, розмір, що має бути на ньому."
+        }
+      ]
+    },
+    {
+      "id": "tiktok",
+      "name": "TikTok",
+      "enabled": false,
+      "base_skill": "skills/base/vychytka-tekstiv.md",
+      "projects": [],
+      "tasks": [
+        {
+          "id": "check",
+          "name": "Вичитка наявного сценарію",
+          "skill": null,
+          "card": true,
+          "hint": "Надішліть сценарій, який треба вичитати."
+        },
+        {
+          "id": "script",
+          "name": "Написання сценарію",
+          "skill": null,
+          "hint": "Опишіть ідею або тему ролика."
+        },
+        {
+          "id": "ideas",
+          "name": "Ресерч ідей під проєкт",
+          "skill": null,
+          "hint": "Опишіть, для чого потрібні ідеї: тема, рубрика, кількість."
+        }
+      ]
+    }
+  ]
+}
