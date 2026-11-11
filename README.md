@@ -127,5 +127,5 @@ docker run -d --restart=always --env-file .env -v "$(pwd)/data:/app/data" --name
 ## Додатково
 
 - `BOT_CLAUDE_MODEL`: модель, за замовчуванням `claude-opus-5-5`.
-- `BOT_CLAUDE_EFFORT`: `low` / `medium` / `high` (за замовчуванням `high`).
+- `BOT_CLAUDE_EFFORT`: `low` / `medium` / `high` (за замовчуванням `medium`).
 - Ти платиш Anthropic за кожну відповідь бота. Скіли кешуються, тому повторні запити дешевші. Точні витрати видно в console.anthropic.com → Usage.
