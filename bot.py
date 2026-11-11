@@ -67,7 +67,7 @@ if not ADMIN_IDS:
     sys.exit("❌ ADMIN_IDS має містити хоча б один числовий Telegram ID.")
 
 CLAUDE_MODEL = os.getenv("BOT_CLAUDE_MODEL", "claude-opus-5-5").strip()
-CLAUDE_EFFORT = os.getenv("BOT_CLAUDE_EFFORT", "high").strip()
+CLAUDE_EFFORT = os.getenv("BOT_CLAUDE_EFFORT", "medium").strip()
 DATA_DIR = Path(os.getenv("BOT_DATA_DIR", BASE_DIR / "data"))
 MENU_FILE = BASE_DIR / "menu.json"
 RULES_FILE = BASE_DIR / "rules.txt"
