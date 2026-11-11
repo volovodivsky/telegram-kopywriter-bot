@@ -79,7 +79,12 @@ FALLBACK_MODELS = {"claude-opus-5-5", "claude-opus-5", "claude-fable-5-1", "clau
 # стільки секунд бот чекає на «хвости», перш ніж відповідати.
 COLLECT_WINDOW_SEC = 2.5
 # Скільки повідомлень (ваших + бота) може бути в одному діалозі до «Новий текст».
-MAX_HISTORY = 40
+MAX_HISTORY = 30
+# Скільки разів бот може видати текст в одній сесії (перша версія + правки).
+# Уточнювальні питання бота й «Картка оцінки» не рахуються.
+MAX_ATTEMPTS = int(os.getenv("BOT_MAX_ATTEMPTS", "2"))
+# Так бот позначає відповідь, у якій лише питання (без тексту).
+QUESTION_MARK = "❓"
 TG_LIMIT = 4096
 
 
@@ -107,6 +112,7 @@ class Task:
     skill: str
     hint: str
     card: bool
+    brief: bool = False  # показувати на старті список «що надіслати» з проєкту
     variants: dict[str, "Task"] = field(default_factory=dict)  # підваріанти (Статика / Reels)
 
 
@@ -116,6 +122,7 @@ class Project:
     name: str
     skill: str
     task_skills: dict[str, str]  # необов'язково: окремий скіл задачі саме для цього проєкту
+    brief: str = ""  # що людина має надіслати для текстових задач цього проєкту
 
 
 @dataclass
@@ -143,19 +150,20 @@ def load_menu() -> dict[str, Direction]:
         tasks = {}
         for t in d.get("tasks", []):
             tid = _check_id(t["id"], f"{did} → задача")
-            task = Task(tid, t["name"], t["name"], load_skill(t.get("skill")), t.get("hint", ""), bool(t.get("card")))
+            task = Task(tid, t["name"], t["name"], load_skill(t.get("skill")), t.get("hint", ""),
+                        bool(t.get("card")), bool(t.get("brief")))
             for v in t.get("variants") or []:
                 vid = _check_id(v["id"], f"{did} → {tid} → варіант")
                 task.variants[vid] = Task(
                     vid, f"{t['name']} · {v['name']}", v["name"], load_skill(v.get("skill")),
-                    v.get("hint", ""), bool(v.get("card")),
+                    v.get("hint", ""), bool(v.get("card")), bool(v.get("brief")),
                 )
             tasks[tid] = task
         projects = {}
         for p in d.get("projects", []):
             pid = _check_id(p["id"], f"{did} → проєкт")
             overrides = {k: load_skill(v) for k, v in (p.get("task_skills") or {}).items()}
-            projects[pid] = Project(pid, p["name"], load_skill(p.get("skill")), overrides)
+            projects[pid] = Project(pid, p["name"], load_skill(p.get("skill")), overrides, p.get("brief", "").strip())
         if projects and tasks:
             result[did] = Direction(did, d["name"], load_skill(d.get("base_skill")), projects, tasks)
     if not result:
@@ -171,10 +179,14 @@ BOT_RULES = """\
 # Робота в Telegram-боті
 
 Ти працюєш у Telegram-боті агенції. Напрям: {direction}. Проєкт: {project}. Задача: {task}.
-
+{checklist}
 Спирайся на скіли вище: базовий (мовні норми й процес вичитки), скіл проєкту (клієнтські домовленості) і скіл задачі (що саме зробити й у якому вигляді віддати). Якщо вони суперечать: мовна норма — з базового, домовленість клієнта — зі скіла проєкту, формат результату — зі скіла задачі.
 
 - Це діалог. Можна поставити уточнювальне питання: людина відповість наступним повідомленням. Питай лише те, без чого не обійтися, одним коротким списком.
+- Поки людина не відповіла на всі пункти, без яких текст не написати, текст не пиши: коротко назви, чого бракує, і зупинись.
+- «Цього не треба», «вирішуй сам» і подібне означають: працюй без цього пункту. Нічого не вигадуй; рубрику чи мету припусти найімовірнішу й напиши припущення одним рядком на початку відповіді.
+- Якщо у відповіді ти лише ставиш питання й не даєш тексту, почни її зі знака ❓. Відповідь із текстом цим знаком не починай.
+- На один текст людина має {attempts} спроби: першу версію та правки. Тому перша версія має бути готовою до публікації, а правку роби повністю за коментарем.
 - Повідомлення людини — це матеріал для роботи (текст, бриф), відповідь на твоє питання або прохання про правки. Розрізняй з контексту.
 - Брифу, контент-плану, Notion і сайту тут немає. Факти бери з повідомлень людини й зі скілів, нічого не вигадуй.
 - Telegram не показує Markdown: жодних **, ##, таблиць і блоків коду. Лише звичайний текст, переноси рядків і емодзі. Назви блоків — окремим рядком.
@@ -197,7 +209,16 @@ def build_system(d: Direction, p: Project, t: Task, skill_key: str) -> list[dict
     if p.skill:
         knowledge += f"\n\n---\n\n# Скіл проєкту: {p.name}\n\n{p.skill}"
     task_skill = p.task_skills.get(skill_key) or t.skill
-    rules = BOT_RULES.format(direction=d.name, project=p.name, task=t.name)
+    checklist = ""
+    if t.brief and p.brief:
+        extra = f"\n{t.hint}" if t.hint else ""
+        checklist = (
+            "\nНа старті людині показали список, що надіслати для цієї задачі:\n"
+            f"{p.brief}{extra}\n"
+            "Перш ніж писати текст, перевір, чи є відповідь на кожен пункт.\n"
+        )
+    rules = BOT_RULES.format(direction=d.name, project=p.name, task=t.name,
+                             checklist=checklist, attempts=MAX_ATTEMPTS)
     if task_skill:
         rules = f"# Скіл задачі: {t.name}\n\n{task_skill}\n\n---\n\n{rules}"
     return [
@@ -367,7 +388,13 @@ class Session:
     task: str
     variant: str | None
     system: list[dict]
+    hint: str = ""
     history: list[dict] = field(default_factory=list)
+    attempts: int = 0  # скільки разів бот уже видав текст у цій сесії
+
+    @property
+    def exhausted(self) -> bool:
+        return self.attempts >= MAX_ATTEMPTS
 
     @property
     def leaf(self) -> Task:
@@ -436,11 +463,33 @@ def variants_kb(d: Direction, p: Project, t: Task) -> Kb:
     return Kb(rows)
 
 
+def task_hint(p: Project, leaf: Task) -> str:
+    """Підказка після вибору задачі: що надіслати й скільки спроб."""
+    if leaf.brief and p.brief:
+        lines = ["📝 Надішліть одним повідомленням:", p.brief]
+        if leaf.hint:
+            lines.append(leaf.hint)
+        lines += ["", "Якщо якийсь пункт не потрібен, напишіть «цього не треба». Поки всіх відповідей немає, бот текст не пише."]
+    else:
+        lines = [f"📝 {leaf.hint}"] if leaf.hint else []
+    lines += ["", f"🔁 На один текст — {MAX_ATTEMPTS} спроби: перша версія й правка. Тож одразу давайте якомога точніші дані."]
+    return "\n".join(lines).strip()
+
+
 def start_session(st: "UserState", d: Direction, p: Project, t: Task, v: Task | None) -> str:
     leaf = v or t
     key = f"{t.id}.{v.id}" if v else t.id
-    st.session = Session(d.id, p.id, t.id, v.id if v else None, build_system(d, p, leaf, key))
-    return f"🧭 {d.name} · 📁 {p.name}\n🛠 {leaf.name}\n\n📝 {leaf.hint}".rstrip()
+    hint = task_hint(p, leaf)
+    st.session = Session(d.id, p.id, t.id, v.id if v else None, build_system(d, p, leaf, key), hint)
+    return f"🧭 {d.name} · 📁 {p.name}\n🛠 {leaf.name}\n\n{hint}"
+
+
+LIMIT_TEXT = (
+    "🔒 Спроби на цьому тексті завершилися ({n} з {n}).\n\n"
+    "Наступного разу давайте точніші дані на старті, і якісний текст вийде з першої спроби. "
+    "А цей текст допрацюйте самостійно, у вас точно вийде! 💪\n\n"
+    "Для нового тексту натисніть «🆕 Новий текст»."
+)
 
 
 def answer_kb(sess: Session, with_card: bool) -> Kb:
@@ -790,9 +839,9 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.message.reply_text(DIRECTIONS_TITLE, reply_markup=directions_kb())
             return
         sess.history.clear()
+        sess.attempts = 0
         await query.answer("Почали з чистого аркуша")
-        hint = sess.leaf.hint
-        await query.message.reply_text(f"🆕 {sess.label}\n\n📝 {hint}".rstrip())
+        await query.message.reply_text(f"🆕 {sess.label}\n\n{sess.hint}".rstrip())
 
     elif data == "other":
         await query.answer()
@@ -904,6 +953,13 @@ async def run_turn(
     user_text: str,
     with_card: bool,
 ) -> None:
+    is_card = user_text == CARD_REQUEST
+    if sess.exhausted and not is_card:
+        await context.bot.send_message(
+            chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=answer_kb(sess, with_card=False)
+        )
+        return
+
     if len(sess.history) >= MAX_HISTORY:
         await context.bot.send_message(
             chat_id, "📚 Діалог уже задовгий. Натисніть «🆕 Новий текст», щоб почати з чистого аркуша.",
@@ -943,10 +999,17 @@ async def run_turn(
         pass
     if not result:
         result = "🤷 Модель повернула порожню відповідь. Спробуйте переформулювати."
+
+    # Спробою вважаємо лише відповідь із текстом: питання бота й картку не рахуємо.
+    is_question = result.startswith(QUESTION_MARK)
+    if not is_card and not is_question:
+        sess.attempts += 1
     chunks = split_for_telegram(result)
     for i, chunk in enumerate(chunks):
-        kb = answer_kb(sess, with_card) if i == len(chunks) - 1 else None
+        kb = answer_kb(sess, with_card and not is_question) if i == len(chunks) - 1 else None
         await context.bot.send_message(chat_id, chunk, reply_markup=kb)
+    if not is_card and not is_question and sess.exhausted:
+        await context.bot.send_message(chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS))
 
 
 # ---------------------------------------------------------------------------
