@@ -598,6 +598,21 @@ FEEDBACK_ASK = (
 
 NEXT_TEXT = "Що далі?"
 
+# Після «Беру в роботу» (і відгуку, якщо його просили).
+DONE_TEXT = (
+    "Дякую, текст вийшов топ! 🔥\n"
+    "Чекаю нове ТЗ для твого проєкту!\n"
+    "Якщо моя допомога зараз не потрібна, піду творити тексти іншим 😉"
+)
+BYE_TEXT = "До зустрічі! 👋 Коли знадоблюсь, тисни /menu або обирай напрям нижче."
+
+
+def done_kb() -> Kb:
+    return Kb([[
+        Btn("📝 Новий текст для проєкту", callback_data="proj"),
+        Btn("👋 Відпускаю тебе", callback_data="bye"),
+    ]])
+
 
 def result_kb(sess: Session) -> Kb:
     row = [Btn("✅ Беру в роботу", callback_data="take")]
@@ -1067,7 +1082,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 reply_markup=Kb([[Btn("⏭ Пропустити", callback_data="fbskip")]]),
             )
         else:
-            await context.bot.send_message(chat_id, NEXT_TEXT, reply_markup=nav_kb())
+            await context.bot.send_message(chat_id, DONE_TEXT, reply_markup=done_kb())
 
     elif data == "fix":
         sess = st.session
@@ -1091,7 +1106,26 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.edit_message_reply_markup(reply_markup=None)
         except TelegramError:
             pass
-        await query.message.reply_text(NEXT_TEXT, reply_markup=nav_kb())
+        await query.message.reply_text(DONE_TEXT, reply_markup=done_kb())
+
+    elif data == "proj":
+        # «Новий текст для проєкту» → меню проєктів того ж напряму.
+        await query.answer()
+        sess = st.session
+        d = MENU.get(sess.direction) if sess else None
+        if d is None:
+            await query.message.reply_text(DIRECTIONS_TITLE, reply_markup=directions_kb())
+        else:
+            await query.message.reply_text(f"🧭 {d.name}\n\n📁 Обери проєкт:", reply_markup=projects_kb(d))
+
+    elif data == "bye":
+        # «Відпускаю тебе» → прощання й головне меню.
+        await query.answer("До зустрічі! 👋")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await query.message.reply_text(BYE_TEXT, reply_markup=directions_kb())
 
     else:
         await query.answer()
@@ -1100,7 +1134,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _show(query, text: str, kb: Kb) -> None:
     """Меню редагуємо на місці; якщо кнопка під відповіддю бота — надсилаємо нове повідомлення."""
     if query.message.reply_markup and any(
-        b.callback_data in {"take", "fix", "fbskip"} for row in query.message.reply_markup.inline_keyboard for b in row
+        b.callback_data in {"take", "fix", "fbskip", "proj", "bye"} for row in query.message.reply_markup.inline_keyboard for b in row
     ):
         await query.message.reply_text(text, reply_markup=kb)
     else:
@@ -1137,7 +1171,8 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         MEMORY.add(did, pid, "відгук", task_name, text, uid)
         MEMORY.mark_feedback(did, pid, uid)
         log.info("Відгук по %s:%s від %s", did, pid, uid)
-        await msg.reply_text("Дякую! Запам'ятав і врахую в наступних текстах ✅\n\n" + NEXT_TEXT, reply_markup=nav_kb())
+        await msg.reply_text("Дякую за відгук! Запам'ятав і врахую в наступних текстах ✅")
+        await msg.reply_text(DONE_TEXT, reply_markup=done_kb())
         return
     sess = st.session
     if sess is None:
