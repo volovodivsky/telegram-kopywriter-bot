@@ -178,6 +178,8 @@ def load_menu() -> dict[str, Direction]:
 
 MENU = load_menu()
 RULES_TEXT = RULES_FILE.read_text(encoding="utf-8").strip()
+# Коротке привітання для тих, хто вже читав правила.
+WELCOME_BACK_TEXT = (BASE_DIR / "welcome_back.txt").read_text(encoding="utf-8").strip()
 
 
 BOT_RULES = """\
@@ -187,6 +189,7 @@ BOT_RULES = """\
 {checklist}
 Спирайся на скіли вище: базовий (мовні норми й процес вичитки), скіл проєкту (клієнтські домовленості) і скіл задачі (що саме зробити й у якому вигляді віддати). Якщо вони суперечать: мовна норма — з базового, домовленість клієнта — зі скіла проєкту, формат результату — зі скіла задачі.
 
+- До людини в чаті звертайся на «ти», дружньо й коротко. Це стосується лише твоїх питань і коментарів; у самих текстах для клієнта звертання — за скілом проєкту.
 - Це діалог. Можна поставити уточнювальне питання: людина відповість наступним повідомленням. Питай лише те, без чого не обійтися, одним коротким списком.
 - Поки людина не відповіла на всі пункти, без яких текст не написати, текст не пиши: коротко назви, чого бракує, і зупинись.
 - «Цього не треба», «вирішуй сам» і подібне означають: працюй без цього пункту. Нічого не вигадуй; рубрику чи мету припусти найімовірнішу й напиши припущення одним рядком на початку відповіді.
@@ -268,20 +271,20 @@ def describe_error(exc: Exception) -> str:
     if isinstance(exc, RefusedError):
         return "🚫 Модель відмовилася обробляти це повідомлення."
     if isinstance(exc, anthropic.AuthenticationError):
-        return "❌ Неправильний ANTHROPIC_API_KEY. Перевірте файл .env."
+        return "❌ Неправильний ANTHROPIC_API_KEY. Перевір файл .env."
     if isinstance(exc, anthropic.PermissionDeniedError):
         return "❌ Ключ Anthropic не має доступу до цієї моделі."
     if isinstance(exc, anthropic.RateLimitError):
-        return "⏳ Забагато запитів до Claude. Спробуйте за хвилину."
+        return "⏳ Забагато запитів до Claude. Спробуй за хвилину."
     if isinstance(exc, anthropic.BadRequestError):
         msg = str(exc.message)
         if "credit" in msg.lower() or "billing" in msg.lower():
             return "💳 На акаунті Anthropic закінчилися кредити."
         return f"❌ Помилка запиту: {msg[:300]}"
     if isinstance(exc, anthropic.APIStatusError):
-        return f"❌ Claude тимчасово недоступний ({exc.status_code}). Спробуйте пізніше."
+        return f"❌ Claude тимчасово недоступний ({exc.status_code}). Спробуй пізніше."
     if isinstance(exc, anthropic.APIConnectionError):
-        return "🌐 Немає з'єднання з Claude. Спробуйте пізніше."
+        return "🌐 Немає з'єднання з Claude. Спробуй пізніше."
     return "❌ Щось пішло не так. Деталі — в логах бота."
 
 
@@ -297,21 +300,32 @@ class AccessStore:
         self.approved: dict[str, dict] = {}
         self.blocked: dict[str, dict] = {}
         self.pending: dict[str, dict] = {}
+        self.rules_seen: list[int] = []  # хто вже натиснув «Ознайомився»
         if path.exists():
             data = json.loads(path.read_text(encoding="utf-8"))
             self.approved = data.get("approved", {})
             self.blocked = data.get("blocked", {})
             self.pending = data.get("pending", {})
+            self.rules_seen = data.get("rules_seen", [])
 
     def _save(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_suffix(".tmp")
-        data = {"approved": self.approved, "blocked": self.blocked, "pending": self.pending}
+        data = {"approved": self.approved, "blocked": self.blocked, "pending": self.pending,
+                "rules_seen": self.rules_seen}
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
     def is_admin(self, uid: int) -> bool:
         return uid in ADMIN_IDS
+
+    def has_seen_rules(self, uid: int) -> bool:
+        return uid in self.rules_seen
+
+    def mark_rules_seen(self, uid: int) -> None:
+        if uid not in self.rules_seen:
+            self.rules_seen.append(uid)
+            self._save()
 
     def is_allowed(self, uid: int) -> bool:
         """Адмін або людина з команди, яка вже поділилася номером."""
@@ -546,13 +560,13 @@ def variants_kb(d: Direction, p: Project, t: Task) -> Kb:
 def task_hint(p: Project, leaf: Task) -> str:
     """Підказка після вибору задачі: що надіслати й скільки спроб."""
     if leaf.brief and p.brief:
-        lines = ["📝 Надішліть одним повідомленням:", p.brief]
+        lines = ["📝 Надішли одним повідомленням:", p.brief]
         if leaf.hint:
             lines.append(leaf.hint)
-        lines += ["", "Якщо якийсь пункт не потрібен, напишіть «цього не треба». Поки всіх відповідей немає, бот текст не пише."]
+        lines += ["", "Якщо якийсь пункт не потрібен, напиши «цього не треба». Поки всіх відповідей немає, текст я не пишу."]
     else:
         lines = [f"📝 {leaf.hint}"] if leaf.hint else []
-    lines += ["", f"🔁 На один текст — {MAX_ATTEMPTS} спроби: перша версія й правка. Тож одразу давайте якомога точніші дані."]
+    lines += ["", f"🔁 На один текст — {MAX_ATTEMPTS} спроби: перша версія й правка. Тож одразу давай максимум деталей 😉"]
     return "\n".join(lines).strip()
 
 
@@ -567,19 +581,19 @@ def start_session(st: "UserState", d: Direction, p: Project, t: Task, v: Task | 
 
 LIMIT_TEXT = (
     "🔒 Спроби на цьому тексті завершилися ({n} з {n}).\n\n"
-    "Наступного разу давайте точніші дані на старті, і якісний текст вийде з першої спроби. "
-    "А цей текст допрацюйте самостійно, у вас точно вийде! 💪\n\n"
-    "Щоб скопіювати текст, натисніть «✅ Беру в роботу» під ним."
+    "Наступного разу давай точніші дані на старті, і якісний текст вийде з першої спроби. "
+    "А цей текст допрацюй самостійно, у тебе точно вийде! 💪\n\n"
+    "Щоб скопіювати текст, тисни «✅ Беру в роботу» під ним."
 )
 
 FIX_PROMPT = (
-    "✏️ Напишіть корективи до тексту одним повідомленням, мінімум {n} слів: що змінити, що прибрати, що додати.\n\n"
+    "✏️ Напиши корективи до тексту одним повідомленням, мінімум {n} слів: що змінити, що прибрати, що додати.\n\n"
     "Я врахую їх у цьому тексті й запам'ятаю для наступних текстів проєкту {project}."
 )
 
 FEEDBACK_ASK = (
-    "🙏 Одне питання по проєкту {project} (питаю лише раз): що в тексті було ок, а що ні?\n\n"
-    "Напишіть кількома реченнями. Я запам'ятаю й урахую це в наступних текстах."
+    "🙏 Одне питання по проєкту {project} (питаю лише раз): що в тексті зайшло, а що ні?\n\n"
+    "Напиши кількома реченнями. Я запам'ятаю й урахую це в наступних текстах."
 )
 
 NEXT_TEXT = "Що далі?"
@@ -601,7 +615,7 @@ def nav_kb() -> Kb:
 
 async def send_copy_blocks(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
     """Текст у блоці з кнопкою «Копіювати». Короткі шматки (≤256 символів) — ще й кнопкою копіювання."""
-    await context.bot.send_message(chat_id, "📋 Текст для копіювання. Натисніть «Копіювати» у кутку блоку:")
+    await context.bot.send_message(chat_id, "📋 Тримай текст. Тисни «Копіювати» у кутку блоку:")
     for chunk in split_for_telegram(text, 3500):
         kb = Kb([[Btn("📋 Скопіювати", copy_text=CopyTextButton(chunk))]]) if len(chunk) <= 256 else None
         await context.bot.send_message(
@@ -632,7 +646,7 @@ def split_for_telegram(text: str, limit: int = TG_LIMIT) -> list[str]:
 # ---------------------------------------------------------------------------
 
 ADMIN_HELP = (
-    "\n\n🔑 Ви адміністратор.\n"
+    "\n\n🔑 Ти адміністратор.\n"
     "/users — команда: картки з телефонами, блокування й розблокування\n"
     "/add ID Ім'я — запросити людину за Telegram ID\n"
     "/memory — пам'ять проєктів: правки й відгуки, які бот враховує"
@@ -651,25 +665,28 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     msg = update.message
     uid = user.id
 
-    if ACCESS.is_admin(uid):
-        await msg.reply_text(RULES_TEXT + ADMIN_HELP, reply_markup=ack_kb())
-        return
-    if ACCESS.is_blocked(uid):
+    if ACCESS.is_blocked(uid) and not ACCESS.is_admin(uid):
         await msg.reply_text("⛔ Доступ заборонено.")
         return
     if ACCESS.is_allowed(uid):
-        await msg.reply_text(RULES_TEXT, reply_markup=ack_kb())
+        extra = ADMIN_HELP if ACCESS.is_admin(uid) else ""
+        if ACCESS.has_seen_rules(uid):
+            # Повторний вхід: коротке привітання й одразу меню.
+            await msg.reply_text(WELCOME_BACK_TEXT + extra, reply_markup=directions_kb())
+        else:
+            # Перший вхід: повні правила й кнопка «Ознайомився».
+            await msg.reply_text(RULES_TEXT + extra, reply_markup=ack_kb())
         return
     if ACCESS.is_pending(uid):
-        await msg.reply_text("⏳ Ваш запит на доступ ще розглядається.")
+        await msg.reply_text("⏳ Твій запит на доступ ще розглядається.")
         return
 
     REG[uid] = {"stage": "phone"}
     intro = (
-        "👋 Вам уже відкрили доступ. Щоб завершити реєстрацію, поділіться номером телефону кнопкою нижче 👇"
+        "👋 Тобі вже відкрили доступ. Щоб завершити реєстрацію, поділись номером телефону кнопкою нижче 👇"
         if ACCESS.is_preapproved(uid) else
-        "🔐 Бот працює лише для команди агенції.\n"
-        "Щоб отримати доступ, поділіться номером телефону кнопкою нижче 👇"
+        "👋 Привіт! Я працюю лише для команди агенції VD.\n"
+        "Щоб отримати доступ, поділись номером телефону кнопкою нижче 👇"
     )
     await msg.reply_text(intro, reply_markup=contact_kb())
 
@@ -681,12 +698,12 @@ async def on_contact(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         return
     contact = msg.contact
     if contact.user_id != uid:
-        await msg.reply_text("Поділіться, будь ласка, власним номером — кнопкою нижче 👇", reply_markup=contact_kb())
+        await msg.reply_text("Поділись, будь ласка, саме своїм номером — кнопкою нижче 👇", reply_markup=contact_kb())
         return
     phone = contact.phone_number if contact.phone_number.startswith("+") else "+" + contact.phone_number
     REG[uid] = {"stage": "name", "phone": phone}
     await msg.reply_text(
-        "Дякую! Тепер напишіть, будь ласка, ваше ім'я та прізвище.", reply_markup=ReplyKeyboardRemove()
+        "Дякую! Тепер напиши, будь ласка, своє ім'я та прізвище.", reply_markup=ReplyKeyboardRemove()
     )
 
 
@@ -716,7 +733,7 @@ async def finish_registration(update: Update, context: ContextTypes.DEFAULT_TYPE
         Btn("❌ Відхилити", callback_data=f"acc:no:{uid}"),
     ]])
     await notify_admins(context, "🔔 Запит на доступ до бота:\n" + person_card(info, uid), kb)
-    await msg.reply_text("📨 Дякую! Запит надіслано адміністратору. Щойно його підтвердять, я напишу вам тут.")
+    await msg.reply_text("📨 Дякую! Запит надіслано адміністратору. Щойно його підтвердять, я напишу тобі тут.")
 
 
 async def notify_admins(context: ContextTypes.DEFAULT_TYPE, text: str, kb: Kb | None = None) -> None:
@@ -761,16 +778,16 @@ def users_view() -> tuple[str, Kb]:
     rows = [[Btn(f"👤 {short_name(i, uid)}", callback_data=f"usr:c:{uid}")] for uid, i in ACCESS.approved.items()]
     rows.append([Btn(f"⛔ Заблоковані ({len(ACCESS.blocked)})", callback_data="usr:bl")])
     if ACCESS.approved:
-        text = f"👥 Команда: {len(ACCESS.approved)}. Натисніть на людину, щоб відкрити картку."
+        text = f"👥 Команда: {len(ACCESS.approved)}. Тисни на людину, щоб відкрити картку."
     else:
-        text = "👥 У команді поки нікого, крім адміністраторів.\nЗапросіть людей через /add або надішліть їм посилання на бота."
+        text = "👥 У команді поки нікого, крім адміністраторів.\nЗапроси людей через /add або надішли їм посилання на бота."
     return text, Kb(rows)
 
 
 def blocked_view() -> tuple[str, Kb]:
     rows = [[Btn(f"⛔ {short_name(i, uid)}", callback_data=f"usr:c:{uid}")] for uid, i in ACCESS.blocked.items()]
     rows.append([Btn("← Команда", callback_data="usr:ls")])
-    text = "⛔ Заблоковані. Натисніть на людину, щоб відкрити картку." if ACCESS.blocked else "⛔ Заблокованих немає."
+    text = "⛔ Заблоковані. Тисни на людину, щоб відкрити картку." if ACCESS.blocked else "⛔ Заблокованих немає."
     return text, Kb(rows)
 
 
@@ -819,7 +836,7 @@ async def on_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         REG.pop(uid, None)
         log.info("Адмін заблокував ID %s", uid)
         try:
-            await context.bot.send_message(uid, "⛔ Ваш доступ до бота закрито.", reply_markup=ReplyKeyboardRemove())
+            await context.bot.send_message(uid, "⛔ Твій доступ до бота закрито.", reply_markup=ReplyKeyboardRemove())
         except TelegramError:
             pass
         text, kb = card_view(uid)
@@ -845,7 +862,7 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     args = context.args or []
     if not args or not args[0].isdigit():
         await update.message.reply_text(
-            "Щоб запросити людину, напишіть:\n/add 123456789 Ім'я\n\n"
+            "Щоб запросити людину, напиши:\n/add 123456789 Ім'я\n\n"
             "ID людина може дізнатися в @userinfobot. Після /start вона поділиться номером та ім'ям "
             "і одразу отримає доступ, без окремого підтвердження."
         )
@@ -861,12 +878,12 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if info.get("phone"):
         note = "Людина вже реєструвалася раніше, доступ відкрито одразу."
         try:
-            await context.bot.send_message(uid, "🎉 Вам надали доступ до бота!\n\n" + RULES_TEXT, reply_markup=ack_kb())
+            await context.bot.send_message(uid, "🎉 Тобі надали доступ до бота!\n\n" + RULES_TEXT, reply_markup=ack_kb())
         except TelegramError:
             pass
     else:
         me = context.bot.username
-        note = (f"Надішліть людині посилання на бота: https://t.me/{me}\n"
+        note = (f"Надішли людині посилання на бота: https://t.me/{me}\n"
                 "Після /start вона поділиться номером та ім'ям і одразу отримає доступ.")
     await update.message.reply_text(f"✅ Запрошено: {short_name(info, uid)} (ID {uid})\n{note}")
 
@@ -882,7 +899,7 @@ def memory_list_view() -> tuple[str, Kb]:
             n = len(MEMORY.entries(d.id, p.id))
             rows.append([Btn(f"📁 {d.name} · {p.name} ({n})", callback_data=f"mem:v:{d.id}:{p.id}")])
     return ("🧠 Пам'ять проєктів: правки й відгуки команди, які бот враховує в нових текстах.\n"
-            "Оберіть проєкт:"), Kb(rows)
+            "Обери проєкт:"), Kb(rows)
 
 
 def memory_project_view(did: str, pid: str) -> tuple[str, Kb]:
@@ -939,7 +956,7 @@ async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Меню
 # ---------------------------------------------------------------------------
 
-DIRECTIONS_TITLE = "🧭 Оберіть напрям:"
+DIRECTIONS_TITLE = "🧭 Обери напрям:"
 
 
 async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -959,6 +976,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     parts = data.split(":")
 
     if data == "ack":
+        ACCESS.mark_rules_seen(uid)
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
         await query.message.reply_text(DIRECTIONS_TITLE, reply_markup=directions_kb())
@@ -973,12 +991,12 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             await query.answer("Цей напрям зараз недоступний", show_alert=True)
             return
         await query.answer()
-        await _show(query, f"🧭 {d.name}\n\n📁 Оберіть проєкт:", projects_kb(d))
+        await _show(query, f"🧭 {d.name}\n\n📁 Обери проєкт:", projects_kb(d))
 
     elif parts[0] == "p" and len(parts) == 3:
         d, p, _ = lookup(parts[1], parts[2])
         if p is None:
-            await query.answer("Меню застаріло, оберіть ще раз", show_alert=True)
+            await query.answer("Меню застаріло, обери ще раз", show_alert=True)
             return
         await query.answer()
         await _show(query, f"🧭 {d.name} · 📁 {p.name}\n\n🛠 Що потрібно зробити?", tasks_kb(d, p))
@@ -986,12 +1004,12 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif parts[0] == "t" and len(parts) == 4:
         d, p, t = lookup(parts[1], parts[2], parts[3])
         if p is None or t is None:
-            await query.answer("Меню застаріло, оберіть ще раз", show_alert=True)
+            await query.answer("Меню застаріло, обери ще раз", show_alert=True)
             return
         await query.answer()
         if t.variants:
             await query.edit_message_text(
-                f"🧭 {d.name} · 📁 {p.name}\n🛠 {t.name}\n\nОберіть формат:", reply_markup=variants_kb(d, p, t)
+                f"🧭 {d.name} · 📁 {p.name}\n🛠 {t.name}\n\nОбери формат:", reply_markup=variants_kb(d, p, t)
             )
         else:
             await query.edit_message_text(start_session(st, d, p, t, None))
@@ -1000,7 +1018,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         d, p, t = lookup(parts[1], parts[2], parts[3])
         v = t.variants.get(parts[4]) if t else None
         if p is None or v is None:
-            await query.answer("Меню застаріло, оберіть ще раз", show_alert=True)
+            await query.answer("Меню застаріло, обери ще раз", show_alert=True)
             return
         await query.answer()
         await query.edit_message_text(start_session(st, d, p, t, v))
@@ -1031,9 +1049,9 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     elif data == "take":
         sess = st.session
         if sess is None or not sess.last_result:
-            await query.answer("Цього тексту вже немає — бот перезапускався. Скопіюйте його вручну.", show_alert=True)
+            await query.answer("Цього тексту вже немає — бот перезапускався. Скопіюй його вручну.", show_alert=True)
             return
-        await query.answer("Текст ваш ✅")
+        await query.answer("Текст твій ✅")
         sess.done = True
         try:
             await query.edit_message_reply_markup(reply_markup=None)
@@ -1101,11 +1119,11 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     reg = REG.get(uid)
     if reg and not ACCESS.is_blocked(uid):
         if reg["stage"] == "phone":
-            await msg.reply_text("Натисніть, будь ласка, кнопку «📱 Поділитися номером» нижче 👇", reply_markup=contact_kb())
+            await msg.reply_text("Тисни, будь ласка, кнопку «📱 Поділитися номером» нижче 👇", reply_markup=contact_kb())
         elif 2 <= len(text) <= 60:
             await finish_registration(update, context, text)
         else:
-            await msg.reply_text("Напишіть, будь ласка, ім'я та прізвище одним коротким повідомленням.")
+            await msg.reply_text("Напиши, будь ласка, ім'я та прізвище одним коротким повідомленням.")
         return
 
     if not ACCESS.is_allowed(uid):
@@ -1123,10 +1141,10 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     sess = st.session
     if sess is None:
-        await msg.reply_text("Спершу оберіть напрям, проєкт і задачу 👇", reply_markup=directions_kb())
+        await msg.reply_text("Спершу обери напрям, проєкт і задачу 👇", reply_markup=directions_kb())
         return
     if sess.done:
-        await msg.reply_text("✅ Цей текст уже взято в роботу. Для нового натисніть «🆕 Новий текст».",
+        await msg.reply_text("✅ Цей текст уже в роботі. Для нового тисни «🆕 Новий текст».",
                              reply_markup=nav_kb())
         return
     if sess.exhausted:
@@ -1158,7 +1176,7 @@ async def _flush_after(uid: int, chat_id: int, context: ContextTypes.DEFAULT_TYP
         if words < MIN_FIX_WORDS:
             await context.bot.send_message(
                 chat_id,
-                f"✏️ Замало деталей ({words} сл.). Опишіть правки докладніше, мінімум {MIN_FIX_WORDS} слів: "
+                f"✏️ Замало деталей ({words} сл.). Опиши правки докладніше, мінімум {MIN_FIX_WORDS} слів: "
                 "що саме змінити і як.",
             )
             return
@@ -1195,7 +1213,7 @@ async def run_turn(
 
     if len(sess.history) >= MAX_HISTORY:
         await context.bot.send_message(
-            chat_id, "📚 Діалог уже задовгий. Натисніть «🆕 Новий текст», щоб почати з чистого аркуша.",
+            chat_id, "📚 Діалог уже задовгий. Тисни «🆕 Новий текст», щоб почати з чистого аркуша.",
             reply_markup=nav_kb(),
         )
         return
@@ -1215,7 +1233,7 @@ async def run_turn(
             log.warning("Claude error: %r", exc)
         else:
             log.exception("Unexpected error")
-        await status.edit_text(describe_error(exc) + "\nНадішліть повідомлення ще раз.")
+        await status.edit_text(describe_error(exc) + "\nНадішли повідомлення ще раз.")
         return
     finally:
         typing.cancel()
@@ -1231,7 +1249,7 @@ async def run_turn(
     except TelegramError:
         pass
     if not result:
-        result = "🤷 Модель повернула порожню відповідь. Спробуйте переформулювати."
+        result = "🤷 Модель повернула порожню відповідь. Спробуй переформулювати."
 
     # Спробою вважаємо лише відповідь із текстом: питання бота не рахуємо.
     is_question = result.startswith(QUESTION_MARK)
