@@ -532,7 +532,13 @@ def _rows(buttons: list[Btn], per_row: int) -> list[list[Btn]]:
 
 
 def ack_kb() -> Kb:
+    """Перший вхід: кнопка під повними правилами."""
     return Kb([[Btn("✅ Ознайомився(-лась)", callback_data="ack")]])
+
+
+def go_kb() -> Kb:
+    """Повторний вхід: кнопка під коротким привітанням."""
+    return Kb([[Btn("✍️ Давай писати!", callback_data="go")]])
 
 
 def directions_kb() -> Kb:
@@ -672,7 +678,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         extra = ADMIN_HELP if ACCESS.is_admin(uid) else ""
         if ACCESS.has_seen_rules(uid):
             # Повторний вхід: коротке привітання й одразу меню.
-            await msg.reply_text(WELCOME_BACK_TEXT + extra, reply_markup=directions_kb())
+            await msg.reply_text(WELCOME_BACK_TEXT + extra, reply_markup=go_kb())
         else:
             # Перший вхід: повні правила й кнопка «Ознайомився».
             await msg.reply_text(RULES_TEXT + extra, reply_markup=ack_kb())
@@ -975,7 +981,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     st = state(uid)
     parts = data.split(":")
 
-    if data == "ack":
+    if data in ("ack", "go"):
         ACCESS.mark_rules_seen(uid)
         await query.answer()
         await query.edit_message_reply_markup(reply_markup=None)
