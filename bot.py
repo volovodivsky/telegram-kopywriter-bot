@@ -12,6 +12,7 @@ Telegram-бот агенції для роботи з текстами.
 from __future__ import annotations
 
 import asyncio
+import html
 import json
 import logging
 import os
@@ -23,10 +24,10 @@ from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from telegram import BotCommand, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, ReplyParameters, Update
+from telegram import BotCommand, CopyTextButton, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, ReplyParameters, Update
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Kb
-from telegram.constants import ChatAction
+from telegram.constants import ChatAction, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import (
     Application,
@@ -85,6 +86,10 @@ MAX_HISTORY = 30
 MAX_ATTEMPTS = int(os.getenv("BOT_MAX_ATTEMPTS", "2"))
 # Так бот позначає відповідь, у якій лише питання (без тексту).
 QUESTION_MARK = "❓"
+# Мінімум слів у правках, щоб бот їх прийняв.
+MIN_FIX_WORDS = 10
+# Скільки останніх записів пам'яті проєкту передавати моделі.
+MEMORY_IN_PROMPT = 40
 TG_LIMIT = 4096
 
 
@@ -193,14 +198,6 @@ BOT_RULES = """\
 - Без вступів на кшталт «Ось текст» і без підсумків наприкінці.
 """
 
-CARD_REQUEST = (
-    "📋 Дай картку оцінки останнього тексту, який я надіслав на вичитку (не твоєї правки), "
-    "за кроком 3 базового скіла. Формат під Telegram, без Markdown і таблиць:\n"
-    "— перший рядок «Рубрика: … (визначено з тексту)»;\n"
-    "— по рядку на кожен із 8 критеріїв: «Назва — бал/5 — коротко що не так»;\n"
-    "— рядок «Вердикт: …»;\n"
-    "— блоки «Помилки» (Де / Що не так / Стало), «Можна підсилити», «Що потребує копірайтера»."
-)
 
 
 def build_system(d: Direction, p: Project, t: Task, skill_key: str) -> list[dict]:
@@ -208,6 +205,9 @@ def build_system(d: Direction, p: Project, t: Task, skill_key: str) -> list[dict
     knowledge = d.base_skill
     if p.skill:
         knowledge += f"\n\n---\n\n# Скіл проєкту: {p.name}\n\n{p.skill}"
+    memory = MEMORY.prompt_block(d.id, p.id)
+    if memory:
+        knowledge += f"\n\n---\n\n{memory}"
     task_skill = p.task_skills.get(skill_key) or t.skill
     checklist = ""
     if t.brief and p.brief:
@@ -222,7 +222,7 @@ def build_system(d: Direction, p: Project, t: Task, skill_key: str) -> list[dict
     if task_skill:
         rules = f"# Скіл задачі: {t.name}\n\n{task_skill}\n\n---\n\n{rules}"
     return [
-        # Базовий скіл + скіл проєкту однакові для всіх задач проєкту — кешуємо.
+        # Базовий скіл + скіл проєкту + пам'ять однакові для всіх задач проєкту — кешуємо.
         {"type": "text", "text": knowledge, "cache_control": {"type": "ephemeral"}},
         {"type": "text", "text": rules},
     ]
@@ -356,6 +356,81 @@ class AccessStore:
 
 
 ACCESS = AccessStore(DATA_DIR / "access.json")
+
+
+# ---------------------------------------------------------------------------
+# Пам'ять проєктів: правки й відгуки команди (data/memory.json)
+# ---------------------------------------------------------------------------
+
+def count_words(text: str) -> int:
+    return len(re.findall(r"[\w'ʼ’-]+", text))
+
+
+class MemoryStore:
+    """Правки й відгуки по кожному проєкту. Бот додає їх у промпт нових текстів проєкту."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.projects: dict[str, list[dict]] = {}
+        self.feedback: dict[str, list[int]] = {}  # хто вже дав разовий відгук по проєкту
+        if path.exists():
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.projects = data.get("projects", {})
+            self.feedback = data.get("feedback", {})
+
+    @staticmethod
+    def key(did: str, pid: str) -> str:
+        return f"{did}:{pid}"
+
+    def _save(self) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        data = {"projects": self.projects, "feedback": self.feedback}
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(self.path)
+
+    def add(self, did: str, pid: str, kind: str, task: str, text: str, uid: int) -> None:
+        entry = {"kind": kind, "task": task, "text": text.strip()[:1500], "uid": uid,
+                 "at": time.strftime("%Y-%m-%d %H:%M")}
+        self.projects.setdefault(self.key(did, pid), []).append(entry)
+        self._save()
+
+    def entries(self, did: str, pid: str) -> list[dict]:
+        return self.projects.get(self.key(did, pid), [])
+
+    def clear(self, did: str, pid: str) -> int:
+        n = len(self.projects.pop(self.key(did, pid), []))
+        self._save()
+        return n
+
+    def feedback_given(self, did: str, pid: str, uid: int) -> bool:
+        return uid in self.feedback.get(self.key(did, pid), [])
+
+    def mark_feedback(self, did: str, pid: str, uid: int) -> None:
+        users = self.feedback.setdefault(self.key(did, pid), [])
+        if uid not in users:
+            users.append(uid)
+            self._save()
+
+    def prompt_block(self, did: str, pid: str) -> str:
+        items = self.entries(did, pid)[-MEMORY_IN_PROMPT:]
+        if not items:
+            return ""
+        lines = [
+            "# Пам'ять проєкту: правки й відгуки команди",
+            "",
+            "Це висновки з попередньої роботи команди над текстами цього проєкту. Враховуй їх як додаткові "
+            "правила проєкту, щоб не повторювати тих самих помилок. Те, що стосувалося лише одного конкретного "
+            "тексту, на інші не переноси. Якщо запис суперечить фактам чи табу скіла проєкту, дотримуйся скіла.",
+            "",
+        ]
+        for e in items:
+            text = " ".join(e["text"].split())[:700]
+            lines.append(f"- [{e['at'][:10]} · {e['task']} · {e['kind']}] {text}")
+        return "\n".join(lines)
+
+
+MEMORY = MemoryStore(DATA_DIR / "memory.json")
 # Реєстрація в процесі: uid -> {"stage": "phone" | "name", "phone": ...}
 REG: dict[int, dict] = {}
 
@@ -391,6 +466,10 @@ class Session:
     hint: str = ""
     history: list[dict] = field(default_factory=list)
     attempts: int = 0  # скільки разів бот уже видав текст у цій сесії
+    last_result: str = ""  # остання версія тексту (її копіює «Беру в роботу»)
+    result_msg: tuple[int, int] | None = None  # де висять кнопки останньої версії
+    last_was_question: bool = False  # остання відповідь бота — питання, а не текст
+    done: bool = False  # текст взято в роботу
 
     @property
     def exhausted(self) -> bool:
@@ -413,6 +492,7 @@ class UserState:
     reply_to: int | None = None
     timer: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    feedback_for: tuple[str, str, str] | None = None  # (напрям, проєкт, задача) — чекаємо відгук
 
 
 STATE: dict[int, UserState] = {}
@@ -480,6 +560,7 @@ def start_session(st: "UserState", d: Direction, p: Project, t: Task, v: Task | 
     leaf = v or t
     key = f"{t.id}.{v.id}" if v else t.id
     hint = task_hint(p, leaf)
+    st.feedback_for = None
     st.session = Session(d.id, p.id, t.id, v.id if v else None, build_system(d, p, leaf, key), hint)
     return f"🧭 {d.name} · 📁 {p.name}\n🛠 {leaf.name}\n\n{hint}"
 
@@ -488,17 +569,44 @@ LIMIT_TEXT = (
     "🔒 Спроби на цьому тексті завершилися ({n} з {n}).\n\n"
     "Наступного разу давайте точніші дані на старті, і якісний текст вийде з першої спроби. "
     "А цей текст допрацюйте самостійно, у вас точно вийде! 💪\n\n"
-    "Для нового тексту натисніть «🆕 Новий текст»."
+    "Щоб скопіювати текст, натисніть «✅ Беру в роботу» під ним."
 )
 
+FIX_PROMPT = (
+    "✏️ Напишіть корективи до тексту одним повідомленням, мінімум {n} слів: що змінити, що прибрати, що додати.\n\n"
+    "Я врахую їх у цьому тексті й запам'ятаю для наступних текстів проєкту {project}."
+)
 
-def answer_kb(sess: Session, with_card: bool) -> Kb:
-    rows = []
-    if with_card and sess.leaf.card:
-        rows.append([Btn("📋 Картка оцінки", callback_data="card")])
-    rows.append([Btn("🆕 Новий текст", callback_data="new"), Btn("🔀 Інша задача", callback_data="other")])
-    rows.append([Btn("☰ Меню", callback_data="menu")])
-    return Kb(rows)
+FEEDBACK_ASK = (
+    "🙏 Одне питання по проєкту {project} (питаю лише раз): що в тексті було ок, а що ні?\n\n"
+    "Напишіть кількома реченнями. Я запам'ятаю й урахую це в наступних текстах."
+)
+
+NEXT_TEXT = "Що далі?"
+
+
+def result_kb(sess: Session) -> Kb:
+    row = [Btn("✅ Беру в роботу", callback_data="take")]
+    if not sess.exhausted:
+        row.append(Btn("✏️ Правки", callback_data="fix"))
+    return Kb([row])
+
+
+def nav_kb() -> Kb:
+    return Kb([
+        [Btn("🆕 Новий текст", callback_data="new"), Btn("🔀 Інша задача", callback_data="other")],
+        [Btn("☰ Меню", callback_data="menu")],
+    ])
+
+
+async def send_copy_blocks(context: ContextTypes.DEFAULT_TYPE, chat_id: int, text: str) -> None:
+    """Текст у блоці з кнопкою «Копіювати». Короткі шматки (≤256 символів) — ще й кнопкою копіювання."""
+    await context.bot.send_message(chat_id, "📋 Текст для копіювання. Натисніть «Копіювати» у кутку блоку:")
+    for chunk in split_for_telegram(text, 3500):
+        kb = Kb([[Btn("📋 Скопіювати", copy_text=CopyTextButton(chunk))]]) if len(chunk) <= 256 else None
+        await context.bot.send_message(
+            chat_id, f"<pre>{html.escape(chunk)}</pre>", parse_mode=ParseMode.HTML, reply_markup=kb
+        )
 
 
 def split_for_telegram(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -526,7 +634,8 @@ def split_for_telegram(text: str, limit: int = TG_LIMIT) -> list[str]:
 ADMIN_HELP = (
     "\n\n🔑 Ви адміністратор.\n"
     "/users — команда: картки з телефонами, блокування й розблокування\n"
-    "/add ID Ім'я — запросити людину за Telegram ID"
+    "/add ID Ім'я — запросити людину за Telegram ID\n"
+    "/memory — пам'ять проєктів: правки й відгуки, які бот враховує"
 )
 
 
@@ -763,6 +872,70 @@ async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Адмін: /memory — чого бот навчився по кожному проєкту
+# ---------------------------------------------------------------------------
+
+def memory_list_view() -> tuple[str, Kb]:
+    rows = []
+    for d in MENU.values():
+        for p in d.projects.values():
+            n = len(MEMORY.entries(d.id, p.id))
+            rows.append([Btn(f"📁 {d.name} · {p.name} ({n})", callback_data=f"mem:v:{d.id}:{p.id}")])
+    return ("🧠 Пам'ять проєктів: правки й відгуки команди, які бот враховує в нових текстах.\n"
+            "Оберіть проєкт:"), Kb(rows)
+
+
+def memory_project_view(did: str, pid: str) -> tuple[str, Kb]:
+    d, p, _ = lookup(did, pid)
+    name = f"{d.name} · {p.name}" if p else f"{did}:{pid}"
+    items = MEMORY.entries(did, pid)
+    back = [Btn("← Проєкти", callback_data="mem:ls")]
+    if not items:
+        return f"🧠 {name}\n\nПам'ять порожня.", Kb([back])
+    lines = [f"🧠 {name}: {len(items)} записів (бот бачить останні {MEMORY_IN_PROMPT}).", ""]
+    for e in items[-15:]:
+        lines.append(f"• {e['at']} · {e['task']} · {e['kind']}\n{' '.join(e['text'].split())[:300]}\n")
+    text = "\n".join(lines)
+    if len(text) > 3900:
+        text = text[:3900] + "…"
+    return text, Kb([[Btn("🗑 Очистити пам'ять проєкту", callback_data=f"mem:c:{did}:{pid}")], back])
+
+
+async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ACCESS.is_admin(update.effective_user.id):
+        return
+    text, kb = memory_list_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not ACCESS.is_admin(query.from_user.id):
+        await query.answer("Лише для адміністратора.")
+        return
+    parts = query.data.split(":")
+    action = parts[1]
+    if action == "ls":
+        text, kb = memory_list_view()
+    elif action == "v" and len(parts) == 4:
+        text, kb = memory_project_view(parts[2], parts[3])
+    elif action == "c" and len(parts) == 4:
+        text = "🗑 Точно очистити всю пам'ять цього проєкту? Бот забуде всі правки й відгуки по ньому."
+        kb = Kb([[Btn("Так, очистити", callback_data=f"mem:cc:{parts[2]}:{parts[3]}"),
+                  Btn("Скасувати", callback_data=f"mem:v:{parts[2]}:{parts[3]}")]])
+    elif action == "cc" and len(parts) == 4:
+        n = MEMORY.clear(parts[2], parts[3])
+        log.info("Адмін очистив пам'ять %s:%s (%s записів)", parts[2], parts[3], n)
+        text, kb = memory_project_view(parts[2], parts[3])
+        text = f"✅ Очищено записів: {n}.\n\n" + text
+    else:
+        await query.answer()
+        return
+    await query.answer()
+    await query.edit_message_text(text, reply_markup=kb)
+
+
+# ---------------------------------------------------------------------------
 # Меню
 # ---------------------------------------------------------------------------
 
@@ -834,14 +1007,15 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif data == "new":
         sess = st.session
-        if sess is None:
+        d, p, t = lookup(sess.direction, sess.project, sess.task) if sess else (None, None, None)
+        if p is None or t is None:
             await query.answer()
             await query.message.reply_text(DIRECTIONS_TITLE, reply_markup=directions_kb())
             return
-        sess.history.clear()
-        sess.attempts = 0
+        v = t.variants.get(sess.variant) if sess.variant else None
         await query.answer("Почали з чистого аркуша")
-        await query.message.reply_text(f"🆕 {sess.label}\n\n{sess.hint}".rstrip())
+        # Нова сесія: свіжий промпт з усією пам'яттю проєкту.
+        await query.message.reply_text("🆕 " + start_session(st, d, p, t, v))
 
     elif data == "other":
         await query.answer()
@@ -854,19 +1028,53 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
                 f"🧭 {d.name} · 📁 {p.name}\n\n🛠 Що потрібно зробити?", reply_markup=tasks_kb(d, p)
             )
 
-    elif data == "card":
+    elif data == "take":
         sess = st.session
-        if sess is None or not sess.history:
-            await query.answer("Надішліть текст ще раз — бот перезапускався.", show_alert=True)
+        if sess is None or not sess.last_result:
+            await query.answer("Цього тексту вже немає — бот перезапускався. Скопіюйте його вручну.", show_alert=True)
             return
-        await query.answer()
+        await query.answer("Текст ваш ✅")
+        sess.done = True
         try:
-            await query.edit_message_reply_markup(reply_markup=answer_kb(sess, with_card=False))
+            await query.edit_message_reply_markup(reply_markup=None)
         except TelegramError:
             pass
-        context.application.create_task(
-            _locked_turn(uid, query.message.chat_id, query.message.message_id, sess, CARD_REQUEST, False, context)
-        )
+        chat_id = query.message.chat_id
+        await send_copy_blocks(context, chat_id, sess.last_result)
+        project = MENU[sess.direction].projects[sess.project]
+        if not MEMORY.feedback_given(sess.direction, sess.project, uid):
+            st.feedback_for = (sess.direction, sess.project, sess.leaf.name)
+            await context.bot.send_message(
+                chat_id, FEEDBACK_ASK.format(project=project.name),
+                reply_markup=Kb([[Btn("⏭ Пропустити", callback_data="fbskip")]]),
+            )
+        else:
+            await context.bot.send_message(chat_id, NEXT_TEXT, reply_markup=nav_kb())
+
+    elif data == "fix":
+        sess = st.session
+        await query.answer()
+        if sess is None or not sess.last_result or sess.done:
+            await query.message.reply_text(NEXT_TEXT, reply_markup=nav_kb())
+        elif sess.exhausted:
+            await query.message.reply_text(LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=nav_kb())
+        else:
+            sess.last_was_question = False
+            project = MENU[sess.direction].projects[sess.project]
+            await query.message.reply_text(FIX_PROMPT.format(n=MIN_FIX_WORDS, project=project.name))
+
+    elif data == "fbskip":
+        await query.answer()
+        if st.feedback_for:
+            did, pid, _ = st.feedback_for
+            MEMORY.mark_feedback(did, pid, uid)
+            st.feedback_for = None
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        await query.message.reply_text(NEXT_TEXT, reply_markup=nav_kb())
+
     else:
         await query.answer()
 
@@ -874,7 +1082,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def _show(query, text: str, kb: Kb) -> None:
     """Меню редагуємо на місці; якщо кнопка під відповіддю бота — надсилаємо нове повідомлення."""
     if query.message.reply_markup and any(
-        b.callback_data in {"new", "other", "card"} for row in query.message.reply_markup.inline_keyboard for b in row
+        b.callback_data in {"take", "fix", "fbskip"} for row in query.message.reply_markup.inline_keyboard for b in row
     ):
         await query.message.reply_text(text, reply_markup=kb)
     else:
@@ -905,8 +1113,24 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     st = state(uid)
-    if st.session is None:
+    if st.feedback_for:
+        did, pid, task_name = st.feedback_for
+        st.feedback_for = None
+        MEMORY.add(did, pid, "відгук", task_name, text, uid)
+        MEMORY.mark_feedback(did, pid, uid)
+        log.info("Відгук по %s:%s від %s", did, pid, uid)
+        await msg.reply_text("Дякую! Запам'ятав і врахую в наступних текстах ✅\n\n" + NEXT_TEXT, reply_markup=nav_kb())
+        return
+    sess = st.session
+    if sess is None:
         await msg.reply_text("Спершу оберіть напрям, проєкт і задачу 👇", reply_markup=directions_kb())
+        return
+    if sess.done:
+        await msg.reply_text("✅ Цей текст уже взято в роботу. Для нового натисніть «🆕 Новий текст».",
+                             reply_markup=nav_kb())
+        return
+    if sess.exhausted:
+        await msg.reply_text(LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=nav_kb())
         return
 
     if not st.parts:
@@ -926,14 +1150,27 @@ async def _flush_after(uid: int, chat_id: int, context: ContextTypes.DEFAULT_TYP
     text = "\n".join(st.parts).strip()
     reply_to, sess = st.reply_to, st.session
     st.parts, st.timer, st.reply_to = [], None, None
-    if text and sess is not None:
-        await _locked_turn(uid, chat_id, reply_to, sess, text, True, context)
+    if not text or sess is None:
+        return
+    if sess.last_result and not sess.last_was_question:
+        # Текст уже є — отже, це правки: перевіряємо обсяг і запам'ятовуємо.
+        words = count_words(text)
+        if words < MIN_FIX_WORDS:
+            await context.bot.send_message(
+                chat_id,
+                f"✏️ Замало деталей ({words} сл.). Опишіть правки докладніше, мінімум {MIN_FIX_WORDS} слів: "
+                "що саме змінити і як.",
+            )
+            return
+        MEMORY.add(sess.direction, sess.project, "правка", sess.leaf.name, text, uid)
+        text = "✏️ Правки до тексту:\n" + text
+    await _locked_turn(uid, chat_id, reply_to, sess, text, context)
 
 
-async def _locked_turn(uid, chat_id, reply_to, sess, user_text, with_card, context) -> None:
+async def _locked_turn(uid, chat_id, reply_to, sess, user_text, context) -> None:
     # Репліки однієї людини обробляються по черзі, щоб діалог не перемішувався.
     async with state(uid).lock:
-        await run_turn(context, chat_id, reply_to, sess, user_text, with_card)
+        await run_turn(context, chat_id, reply_to, sess, user_text)
 
 
 async def _keep_typing(context: ContextTypes.DEFAULT_TYPE, chat_id: int) -> None:
@@ -951,19 +1188,15 @@ async def run_turn(
     reply_to: int | None,
     sess: Session,
     user_text: str,
-    with_card: bool,
 ) -> None:
-    is_card = user_text == CARD_REQUEST
-    if sess.exhausted and not is_card:
-        await context.bot.send_message(
-            chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=answer_kb(sess, with_card=False)
-        )
+    if sess.exhausted:
+        await context.bot.send_message(chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=nav_kb())
         return
 
     if len(sess.history) >= MAX_HISTORY:
         await context.bot.send_message(
             chat_id, "📚 Діалог уже задовгий. Натисніть «🆕 Новий текст», щоб почати з чистого аркуша.",
-            reply_markup=answer_kb(sess, with_card=False),
+            reply_markup=nav_kb(),
         )
         return
 
@@ -1000,16 +1233,28 @@ async def run_turn(
     if not result:
         result = "🤷 Модель повернула порожню відповідь. Спробуйте переформулювати."
 
-    # Спробою вважаємо лише відповідь із текстом: питання бота й картку не рахуємо.
+    # Спробою вважаємо лише відповідь із текстом: питання бота не рахуємо.
     is_question = result.startswith(QUESTION_MARK)
-    if not is_card and not is_question:
+    sess.last_was_question = is_question
+    if not is_question:
         sess.attempts += 1
+        sess.last_result = result
+        if sess.result_msg:  # кнопки лишаються тільки під останньою версією
+            try:
+                await context.bot.edit_message_reply_markup(
+                    chat_id=sess.result_msg[0], message_id=sess.result_msg[1], reply_markup=None
+                )
+            except TelegramError:
+                pass
     chunks = split_for_telegram(result)
+    sent = None
     for i, chunk in enumerate(chunks):
-        kb = answer_kb(sess, with_card and not is_question) if i == len(chunks) - 1 else None
-        await context.bot.send_message(chat_id, chunk, reply_markup=kb)
-    if not is_card and not is_question and sess.exhausted:
-        await context.bot.send_message(chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS))
+        kb = result_kb(sess) if i == len(chunks) - 1 and not is_question else None
+        sent = await context.bot.send_message(chat_id, chunk, reply_markup=kb)
+    if not is_question:
+        sess.result_msg = (chat_id, sent.message_id)
+        if sess.exhausted:
+            await context.bot.send_message(chat_id, LIMIT_TEXT.format(n=MAX_ATTEMPTS), reply_markup=nav_kb())
 
 
 # ---------------------------------------------------------------------------
@@ -1036,6 +1281,8 @@ def build_app() -> Application:
     app.add_handler(CommandHandler("add", cmd_add, filters=private))
     app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^acc:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_users, pattern=r"^usr:"))
+    app.add_handler(CommandHandler("memory", cmd_memory, filters=private))
+    app.add_handler(CallbackQueryHandler(on_memory, pattern=r"^mem:"))
     app.add_handler(MessageHandler(private & filters.CONTACT, on_contact))
     app.add_handler(CallbackQueryHandler(on_menu))
     app.add_handler(MessageHandler(private & filters.TEXT & ~filters.COMMAND, on_text))
