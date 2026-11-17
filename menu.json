@@ -71,7 +71,7 @@
     },
     {
       "id": "target",
-      "name": "Target",
+      "name": "Meta ADS",
       "enabled": true,
       "base_skill": "skills/base/vychytka-tekstiv.md",
       "projects": [
