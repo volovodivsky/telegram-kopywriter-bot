@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import secrets
 import sys
 import time
 from dataclasses import dataclass, field
@@ -400,6 +401,15 @@ class MemoryStore:
             data = json.loads(path.read_text(encoding="utf-8"))
             self.projects = data.get("projects", {})
             self.feedback = data.get("feedback", {})
+        # Кожен запис має id, щоб його можна було редагувати й видаляти з бота.
+        changed = False
+        for items in self.projects.values():
+            for e in items:
+                if "id" not in e:
+                    e["id"] = secrets.token_hex(3)
+                    changed = True
+        if changed:
+            self._save()
 
     @staticmethod
     def key(did: str, pid: str) -> str:
@@ -412,11 +422,31 @@ class MemoryStore:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    def add(self, did: str, pid: str, kind: str, task: str, text: str, uid: int) -> None:
-        entry = {"kind": kind, "task": task, "text": text.strip()[:1500], "uid": uid,
-                 "at": time.strftime("%Y-%m-%d %H:%M")}
+    def add(self, did: str, pid: str, kind: str, task: str, text: str, uid: int) -> str:
+        entry = {"id": secrets.token_hex(3), "kind": kind, "task": task, "text": text.strip()[:1500],
+                 "uid": uid, "at": time.strftime("%Y-%m-%d %H:%M")}
         self.projects.setdefault(self.key(did, pid), []).append(entry)
         self._save()
+        return entry["id"]
+
+    def get(self, did: str, pid: str, eid: str) -> dict | None:
+        return next((e for e in self.entries(did, pid) if e.get("id") == eid), None)
+
+    def update(self, did: str, pid: str, eid: str, text: str) -> bool:
+        e = self.get(did, pid, eid)
+        if e is None:
+            return False
+        e["text"] = text.strip()[:1500]
+        e["edited_at"] = time.strftime("%Y-%m-%d %H:%M")
+        self._save()
+        return True
+
+    def delete(self, did: str, pid: str, eid: str) -> bool:
+        items = self.entries(did, pid)
+        before = len(items)
+        items[:] = [e for e in items if e.get("id") != eid]
+        self._save()
+        return len(items) < before
 
     def entries(self, did: str, pid: str) -> list[dict]:
         return self.projects.get(self.key(did, pid), [])
@@ -516,6 +546,7 @@ class UserState:
     timer: asyncio.Task | None = None
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     feedback_for: tuple[str, str, str] | None = None  # (напрям, проєкт, задача) — чекаємо відгук
+    mem_edit: tuple[str, str, str | None] | None = None  # адмін редагує пам'ять: (напрям, проєкт, id або None = новий)
 
 
 STATE: dict[int, UserState] = {}
@@ -673,7 +704,7 @@ ADMIN_HELP = (
     "\n\n🔑 Ти адміністратор.\n"
     "/users — команда: картки з телефонами, блокування й розблокування\n"
     "/add ID Ім'я — запросити людину за Telegram ID\n"
-    "/memory — пам'ять проєктів: правки й відгуки, які бот враховує"
+    "/memory — пам'ять проєктів: переглянути, відредагувати, видалити чи додати правило"
 )
 
 
@@ -926,54 +957,146 @@ def memory_list_view() -> tuple[str, Kb]:
             "Обери проєкт:"), Kb(rows)
 
 
-def memory_project_view(did: str, pid: str) -> tuple[str, Kb]:
+def _project_name(did: str, pid: str) -> str:
     d, p, _ = lookup(did, pid)
-    name = f"{d.name} · {p.name}" if p else f"{did}:{pid}"
+    return f"{d.name} · {p.name}" if p else f"{did}:{pid}"
+
+
+def _short(text: str, n: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def memory_project_view(did: str, pid: str) -> tuple[str, Kb]:
+    name = _project_name(did, pid)
     items = MEMORY.entries(did, pid)
-    back = [Btn("← Проєкти", callback_data="mem:ls")]
+    rows = [[Btn(f"{i}. {e['kind']} · {_short(e['text'], 40)}", callback_data=f"mem:e:{did}:{pid}:{e['id']}")]
+            for i, e in enumerate(items, 1)][-40:]
+    rows.append([Btn("➕ Додати правило", callback_data=f"mem:a:{did}:{pid}")])
+    if items:
+        rows.append([Btn("🗑 Очистити всю пам'ять", callback_data=f"mem:c:{did}:{pid}")])
+    rows.append([Btn("← Проєкти", callback_data="mem:ls")])
     if not items:
-        return f"🧠 {name}\n\nПам'ять порожня.", Kb([back])
-    lines = [f"🧠 {name}: {len(items)} записів (бот бачить останні {MEMORY_IN_PROMPT}).", ""]
-    for e in items[-15:]:
-        lines.append(f"• {e['at']} · {e['task']} · {e['kind']}\n{' '.join(e['text'].split())[:300]}\n")
-    text = "\n".join(lines)
-    if len(text) > 3900:
-        text = text[:3900] + "…"
-    return text, Kb([[Btn("🗑 Очистити пам'ять проєкту", callback_data=f"mem:c:{did}:{pid}")], back])
+        return f"🧠 {name}\n\nПам'ять порожня. Можна додати правило вручну.", Kb(rows)
+    text = (f"🧠 {name}: {len(items)} записів (бот бачить останні {MEMORY_IN_PROMPT}).\n\n"
+            "Тисни на запис, щоб переглянути, відредагувати чи видалити його.")
+    return text, Kb(rows)
+
+
+def memory_entry_view(did: str, pid: str, eid: str) -> tuple[str, Kb]:
+    e = MEMORY.get(did, pid, eid)
+    back = Btn("← До пам'яті проєкту", callback_data=f"mem:v:{did}:{pid}")
+    if e is None:
+        return "Цього запису вже немає.", Kb([[back]])
+    edited = f"\n✏️ Відредаговано: {e['edited_at']}" if e.get("edited_at") else ""
+    text = (f"🧠 {_project_name(did, pid)}\n"
+            f"🗓 {e['at']} · {e['task']} · {e['kind']}{edited}\n\n{e['text'][:3500]}")
+    return text, Kb([
+        [Btn("✏️ Редагувати", callback_data=f"mem:w:{did}:{pid}:{eid}"),
+         Btn("🗑 Видалити", callback_data=f"mem:d:{did}:{pid}:{eid}")],
+        [back],
+    ])
 
 
 async def cmd_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not ACCESS.is_admin(update.effective_user.id):
         return
+    state(update.effective_user.id).mem_edit = None
     text, kb = memory_list_view()
     await update.message.reply_text(text, reply_markup=kb)
 
 
 async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    if not ACCESS.is_admin(query.from_user.id):
+    uid = query.from_user.id
+    if not ACCESS.is_admin(uid):
         await query.answer("Лише для адміністратора.")
         return
+    st = state(uid)
     parts = query.data.split(":")
     action = parts[1]
+    did, pid = (parts[2], parts[3]) if len(parts) >= 4 else ("", "")
+    eid = parts[4] if len(parts) == 5 else None
+
     if action == "ls":
+        st.mem_edit = None
         text, kb = memory_list_view()
-    elif action == "v" and len(parts) == 4:
-        text, kb = memory_project_view(parts[2], parts[3])
-    elif action == "c" and len(parts) == 4:
+    elif action == "v" and pid:
+        st.mem_edit = None
+        text, kb = memory_project_view(did, pid)
+    elif action == "e" and eid:
+        text, kb = memory_entry_view(did, pid, eid)
+    elif action == "w" and eid:
+        e = MEMORY.get(did, pid, eid)
+        if e is None:
+            text, kb = memory_project_view(did, pid)
+        else:
+            st.mem_edit = (did, pid, eid)
+            await query.answer()
+            await query.message.reply_text(
+                "✏️ Надішли новий текст цього запису одним повідомленням. Він повністю замінить старий.\n\n"
+                f"Зараз там:\n{e['text'][:3000]}",
+                reply_markup=Kb([[Btn("Скасувати", callback_data=f"mem:x:{did}:{pid}")]]),
+            )
+            return
+    elif action == "a" and pid:
+        st.mem_edit = (did, pid, None)
+        await query.answer()
+        await query.message.reply_text(
+            f"➕ Напиши правило для проєкту {_project_name(did, pid)} одним повідомленням.\n"
+            "Наприклад: «У CTA завжди посилання на сайт, без Direct».",
+            reply_markup=Kb([[Btn("Скасувати", callback_data=f"mem:x:{did}:{pid}")]]),
+        )
+        return
+    elif action == "x" and pid:
+        st.mem_edit = None
+        await query.answer("Скасовано")
+        try:
+            await query.edit_message_reply_markup(reply_markup=None)
+        except TelegramError:
+            pass
+        text, kb = memory_project_view(did, pid)
+        await query.message.reply_text(text, reply_markup=kb)
+        return
+    elif action == "d" and eid:
+        text = "🗑 Видалити цей запис? Бот перестане його враховувати."
+        kb = Kb([[Btn("Так, видалити", callback_data=f"mem:dd:{did}:{pid}:{eid}"),
+                  Btn("Скасувати", callback_data=f"mem:e:{did}:{pid}:{eid}")]])
+    elif action == "dd" and eid:
+        ok_ = MEMORY.delete(did, pid, eid)
+        log.info("Адмін видалив запис пам'яті %s:%s/%s", did, pid, eid)
+        text, kb = memory_project_view(did, pid)
+        text = ("✅ Запис видалено.\n\n" if ok_ else "Цього запису вже немає.\n\n") + text
+    elif action == "c" and pid:
         text = "🗑 Точно очистити всю пам'ять цього проєкту? Бот забуде всі правки й відгуки по ньому."
-        kb = Kb([[Btn("Так, очистити", callback_data=f"mem:cc:{parts[2]}:{parts[3]}"),
-                  Btn("Скасувати", callback_data=f"mem:v:{parts[2]}:{parts[3]}")]])
-    elif action == "cc" and len(parts) == 4:
-        n = MEMORY.clear(parts[2], parts[3])
-        log.info("Адмін очистив пам'ять %s:%s (%s записів)", parts[2], parts[3], n)
-        text, kb = memory_project_view(parts[2], parts[3])
+        kb = Kb([[Btn("Так, очистити", callback_data=f"mem:cc:{did}:{pid}"),
+                  Btn("Скасувати", callback_data=f"mem:v:{did}:{pid}")]])
+    elif action == "cc" and pid:
+        n = MEMORY.clear(did, pid)
+        log.info("Адмін очистив пам'ять %s:%s (%s записів)", did, pid, n)
+        text, kb = memory_project_view(did, pid)
         text = f"✅ Очищено записів: {n}.\n\n" + text
     else:
         await query.answer()
         return
     await query.answer()
     await query.edit_message_text(text, reply_markup=kb)
+
+
+async def apply_memory_edit(update: Update, st: "UserState", text: str) -> None:
+    """Адмін надіслав новий текст запису пам'яті або нове правило."""
+    did, pid, eid = st.mem_edit
+    st.mem_edit = None
+    uid = update.effective_user.id
+    if eid:
+        done = MEMORY.update(did, pid, eid, text)
+        note = "✅ Запис оновлено." if done else "Цього запису вже немає."
+    else:
+        MEMORY.add(did, pid, "правило адміна", "усі задачі", text, uid)
+        note = "✅ Правило додано. Бот враховуватиме його в нових текстах проєкту."
+    log.info("Адмін змінив пам'ять %s:%s", did, pid)
+    view, kb = memory_project_view(did, pid)
+    await update.message.reply_text(f"{note}\n\n{view}", reply_markup=kb)
 
 
 # ---------------------------------------------------------------------------
@@ -1174,6 +1297,9 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     st = state(uid)
+    if st.mem_edit and ACCESS.is_admin(uid):
+        await apply_memory_edit(update, st, text)
+        return
     if st.feedback_for:
         did, pid, task_name = st.feedback_for
         st.feedback_for = None
