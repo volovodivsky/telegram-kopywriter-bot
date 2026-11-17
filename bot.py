@@ -25,7 +25,7 @@ from pathlib import Path
 
 import anthropic
 from dotenv import load_dotenv
-from telegram import BotCommand, CopyTextButton, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, ReplyParameters, Update
+from telegram import BotCommand, BotCommandScopeChat, CopyTextButton, KeyboardButton, ReplyKeyboardMarkup, ReplyKeyboardRemove, ReplyParameters, Update
 from telegram import InlineKeyboardButton as Btn
 from telegram import InlineKeyboardMarkup as Kb
 from telegram.constants import ChatAction, ParseMode
@@ -725,6 +725,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     if ACCESS.is_allowed(uid):
         extra = ADMIN_HELP if ACCESS.is_admin(uid) else ""
+        if ACCESS.is_admin(uid):
+            await set_admin_commands(context.bot, uid)
         if ACCESS.has_seen_rules(uid):
             # Повторний вхід: коротке привітання й одразу меню.
             await msg.reply_text(WELCOME_BACK_TEXT + extra, reply_markup=directions_kb())
@@ -1453,11 +1455,29 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     log.error("Помилка обробки оновлення", exc_info=context.error)
 
 
+USER_COMMANDS = [
+    BotCommand("start", "Правила й початок роботи"),
+    BotCommand("menu", "Вибір напряму, проєкту й задачі"),
+]
+ADMIN_COMMANDS = USER_COMMANDS + [
+    BotCommand("users", "Команда: телефони, блокування"),
+    BotCommand("add", "Запросити людину: /add ID Ім'я"),
+    BotCommand("memory", "Пам'ять проєктів: правки й правила"),
+]
+
+
+async def set_admin_commands(bot, admin_id: int) -> None:
+    """Адміни бачать у меню команд ще /users, /add і /memory."""
+    try:
+        await bot.set_my_commands(ADMIN_COMMANDS, scope=BotCommandScopeChat(admin_id))
+    except TelegramError:
+        log.warning("Не вдалося задати меню команд адміну %s (він ще не натиснув /start?)", admin_id)
+
+
 async def post_init(app: Application) -> None:
-    await app.bot.set_my_commands([
-        BotCommand("start", "Правила й початок роботи"),
-        BotCommand("menu", "Вибір напряму, проєкту й задачі"),
-    ])
+    await app.bot.set_my_commands(USER_COMMANDS)
+    for admin_id in ADMIN_IDS:
+        await set_admin_commands(app.bot, admin_id)
 
 
 def build_app() -> Application:
