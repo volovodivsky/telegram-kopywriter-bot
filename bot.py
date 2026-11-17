@@ -109,6 +109,15 @@ def load_skill(rel_path: str | None) -> str:
     return text.strip()
 
 
+def load_skills(value: str | list[str] | None) -> str:
+    """Скіл проєкту: один файл або список файлів (напр. таргет спирається ще й на SMM-скіл клієнта)."""
+    if not value:
+        return ""
+    if isinstance(value, str):
+        return load_skill(value)
+    return "\n\n---\n\n".join(load_skill(v) for v in value)
+
+
 @dataclass
 class Task:
     id: str
@@ -168,7 +177,7 @@ def load_menu() -> dict[str, Direction]:
         for p in d.get("projects", []):
             pid = _check_id(p["id"], f"{did} → проєкт")
             overrides = {k: load_skill(v) for k, v in (p.get("task_skills") or {}).items()}
-            projects[pid] = Project(pid, p["name"], load_skill(p.get("skill")), overrides, p.get("brief", "").strip())
+            projects[pid] = Project(pid, p["name"], load_skills(p.get("skill")), overrides, p.get("brief", "").strip())
         if projects and tasks:
             result[did] = Direction(did, d["name"], load_skill(d.get("base_skill")), projects, tasks)
     if not result:
