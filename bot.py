@@ -252,7 +252,7 @@ class RefusedError(Exception):
     pass
 
 
-async def ask_claude(system: list[dict], history: list[dict]):
+async def ask_claude(system: list[dict], history: list[dict], effort: str | None = None):
     """Відправляє весь діалог і повертає відповідь моделі (Message)."""
     extra: dict = {}
     if CLAUDE_MODEL in FALLBACK_MODELS:
@@ -260,7 +260,7 @@ async def ask_claude(system: list[dict], history: list[dict]):
     async with claude.beta.messages.stream(
         model=CLAUDE_MODEL,
         max_tokens=32000,
-        output_config={"effort": CLAUDE_EFFORT},
+        output_config={"effort": effort or CLAUDE_EFFORT},
         system=system,
         messages=history,
         cache_control={"type": "ephemeral"},  # кешуємо й попередні репліки діалогу
@@ -422,9 +422,11 @@ class MemoryStore:
         tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         tmp.replace(self.path)
 
-    def add(self, did: str, pid: str, kind: str, task: str, text: str, uid: int) -> str:
+    def add(self, did: str, pid: str, kind: str, task: str, text: str, uid: int, source: str | None = None) -> str:
         entry = {"id": secrets.token_hex(3), "kind": kind, "task": task, "text": text.strip()[:1500],
                  "uid": uid, "at": time.strftime("%Y-%m-%d %H:%M")}
+        if source:
+            entry["source"] = source.strip()[:1500]  # коментар, з якого виведено правило
         self.projects.setdefault(self.key(did, pid), []).append(entry)
         self._save()
         return entry["id"]
@@ -440,6 +442,16 @@ class MemoryStore:
         e["edited_at"] = time.strftime("%Y-%m-%d %H:%M")
         self._save()
         return True
+
+    def replace(self, did: str, pid: str, rules: list[str], uid: int, source: str) -> None:
+        """Замінює всю пам'ять проєкту зведеним списком правил."""
+        stamp = time.strftime("%Y-%m-%d %H:%M")
+        self.projects[self.key(did, pid)] = [
+            {"id": secrets.token_hex(3), "kind": "висновок", "task": "усі задачі", "text": r[:1500],
+             "uid": uid, "at": stamp, "source": source}
+            for r in rules
+        ]
+        self._save()
 
     def delete(self, did: str, pid: str, eid: str) -> bool:
         items = self.entries(did, pid)
@@ -470,20 +482,90 @@ class MemoryStore:
         if not items:
             return ""
         lines = [
-            "# Пам'ять проєкту: правки й відгуки команди",
+            "# Пам'ять проєкту: правила з правок і відгуків команди",
             "",
-            "Це висновки з попередньої роботи команди над текстами цього проєкту. Враховуй їх як додаткові "
-            "правила проєкту, щоб не повторювати тих самих помилок. Те, що стосувалося лише одного конкретного "
-            "тексту, на інші не переноси. Якщо запис суперечить фактам чи табу скіла проєкту, дотримуйся скіла.",
+            "Це правила, які команда вивела з попередньої роботи над текстами цього проєкту. Дотримуйся їх, "
+            "щоб не повторювати тих самих помилок. Якщо правило суперечить фактам чи табу скіла проєкту, "
+            "дотримуйся скіла; якщо правила суперечать одне одному, діє новіше (нижче в списку).",
             "",
         ]
         for e in items:
             text = " ".join(e["text"].split())[:700]
-            lines.append(f"- [{e['at'][:10]} · {e['task']} · {e['kind']}] {text}")
+            lines.append(f"- {text}")
         return "\n".join(lines)
 
 
 MEMORY = MemoryStore(DATA_DIR / "memory.json")
+
+
+LEARN_SYSTEM = """\
+Ти ведеш пам'ять проєкту {project} у боті агенції. Копірайтер дав коментар до конкретного тексту. \
+Витягни з коментаря загальні правила, які варто застосовувати в майбутніх текстах цього проєкту.
+
+- Кожне правило — одне коротке речення-інструкція («Пиши…», «Не використовуй…», «Перший кадр — …»), \
+зрозуміле без контексту конкретного тексту.
+- Лише те, що можна застосувати до інших текстів. Деталі одного тексту (дата, конкретний кадр) — не правило, \
+але узагальни, якщо за ними стоїть принцип: «перший кадр задовгий» → «Перший кадр сторіз — одне коротке речення».
+- Не дублюй правила, які вже є в пам'яті. Якщо коментар уточнює наявне правило, сформулюй уточнене.
+- Від 0 до 3 правил. Якщо загального нічого немає, відповідай одним словом: НЕМАЄ.
+- Формат: кожне правило з нового рядка, на початку «- ». Без вступів і пояснень.
+"""
+
+CONSOLIDATE_SYSTEM = """\
+Ти ведеш пам'ять проєкту {project} у боті агенції. Нижче всі записи пам'яті: правила, сирі правки й відгуки \
+копірайтерів. Зведи їх в акуратний список правил для майбутніх текстів проєкту.
+
+- Кожне правило — одне коротке речення-інструкція, зрозуміле без контексту конкретного тексту.
+- Об'єднай дублі й близькі за змістом записи. Те, що стосувалося лише одного тексту й не несе принципу, прибери.
+- Якщо записи суперечать одне одному, залиш новіший (нижче в списку).
+- Не більше 25 правил, найважливіші — вгорі.
+- Формат: кожне правило з нового рядка, на початку «- ». Без вступів і пояснень. Якщо правил немає — НЕМАЄ.
+"""
+
+
+def parse_rules(text: str, limit: int) -> list[str]:
+    if text.strip().upper().startswith("НЕМАЄ"):
+        return []
+    rules = []
+    for line in text.splitlines():
+        line = line.strip()
+        if line[:2] in ("- ", "• ", "* ", "— "):
+            rule = line[2:].strip()
+            if rule:
+                rules.append(rule)
+    return rules[:limit]
+
+
+async def learn_from_comment(did: str, pid: str, kind: str, task: str, comment: str,
+                             about_text: str, uid: int) -> list[str] | None:
+    """Формулює з правки чи відгуку загальні правила й зберігає їх у пам'ять проєкту.
+    Повертає список правил; [] — нічого загального; None — не вдалося, коментар збережено як є."""
+    project = MENU[did].projects[pid].name if did in MENU and pid in MENU[did].projects else pid
+    existing = "\n".join(f"- {e['text']}" for e in MEMORY.entries(did, pid)[-MEMORY_IN_PROMPT:]) or "(порожньо)"
+    user = (f"Задача: {task}\n\nТекст, до якого коментар:\n<text>\n{about_text[:4000]}\n</text>\n\n"
+            f"Коментар копірайтера ({kind}):\n<comment>\n{comment}\n</comment>\n\nВже в пам'яті:\n{existing}")
+    try:
+        msg = await ask_claude([{"type": "text", "text": LEARN_SYSTEM.format(project=project)}],
+                               [{"role": "user", "content": user}], effort="low")
+        rules = parse_rules("".join(b.text for b in msg.content if b.type == "text"), 3)
+    except Exception:  # noqa: BLE001
+        log.exception("Не вдалося сформулювати висновки")
+        MEMORY.add(did, pid, kind, task, comment, uid)
+        return None
+    for rule in rules:
+        MEMORY.add(did, pid, kind, task, rule, uid, source=comment)
+    log.info("Пам'ять %s:%s: +%s правил з %s", did, pid, len(rules), kind)
+    return rules
+
+
+def learned_text(did: str, pid: str, rules: list[str] | None, kind: str) -> str:
+    project = MENU[did].projects[pid].name if did in MENU and pid in MENU[did].projects else pid
+    if rules is None:
+        return f"🧠 Зберіг коментар у пам'ять проєкту {project} як є: сформулювати висновки зараз не вийшло."
+    if not rules:
+        what = "Правка стосувалася" if kind == "правка" else "Відгук стосувався"
+        return f"🧠 {what} лише цього тексту, тож нових правил для {project} не додав."
+    return f"🧠 Запам'ятав для проєкту {project}:\n" + "\n".join(f"• {r}" for r in rules)
 # Реєстрація в процесі: uid -> {"stage": "phone" | "name", "phone": ...}
 REG: dict[int, dict] = {}
 
@@ -547,6 +629,7 @@ class UserState:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     feedback_for: tuple[str, str, str] | None = None  # (напрям, проєкт, задача) — чекаємо відгук
     mem_edit: tuple[str, str, str | None] | None = None  # адмін редагує пам'ять: (напрям, проєкт, id або None = новий)
+    mem_preview: tuple[str, str, list[str]] | None = None  # зведені правила, що чекають «Зберегти»
 
 
 STATE: dict[int, UserState] = {}
@@ -704,7 +787,7 @@ ADMIN_HELP = (
     "\n\n🔑 Ти адміністратор.\n"
     "/users — команда: картки з телефонами, блокування й розблокування\n"
     "/add ID Ім'я — запросити людину за Telegram ID\n"
-    "/memory — пам'ять проєктів: переглянути, відредагувати, видалити чи додати правило"
+    "/memory — пам'ять проєктів: правила, які бот вивів із правок і відгуків"
 )
 
 
@@ -976,12 +1059,14 @@ def memory_project_view(did: str, pid: str) -> tuple[str, Kb]:
             for i, e in enumerate(items, 1)][-40:]
     rows.append([Btn("➕ Додати правило", callback_data=f"mem:a:{did}:{pid}")])
     if items:
+        rows.append([Btn("🧠 Зробити висновки з усіх записів", callback_data=f"mem:r:{did}:{pid}")])
         rows.append([Btn("🗑 Очистити всю пам'ять", callback_data=f"mem:c:{did}:{pid}")])
     rows.append([Btn("← Проєкти", callback_data="mem:ls")])
     if not items:
         return f"🧠 {name}\n\nПам'ять порожня. Можна додати правило вручну.", Kb(rows)
-    text = (f"🧠 {name}: {len(items)} записів (бот бачить останні {MEMORY_IN_PROMPT}).\n\n"
-            "Тисни на запис, щоб переглянути, відредагувати чи видалити його.")
+    text = (f"🧠 {name}: {len(items)} правил (бот враховує останні {MEMORY_IN_PROMPT}).\n\n"
+            "Тисни на правило, щоб побачити, з якого коментаря воно взялося, відредагувати чи видалити його.\n"
+            "«🧠 Зробити висновки» зведе всі записи в акуратний список без дублів.")
     return text, Kb(rows)
 
 
@@ -991,8 +1076,9 @@ def memory_entry_view(did: str, pid: str, eid: str) -> tuple[str, Kb]:
     if e is None:
         return "Цього запису вже немає.", Kb([[back]])
     edited = f"\n✏️ Відредаговано: {e['edited_at']}" if e.get("edited_at") else ""
+    source = f"\n\n💬 З коментаря:\n{e['source'][:1500]}" if e.get("source") else ""
     text = (f"🧠 {_project_name(did, pid)}\n"
-            f"🗓 {e['at']} · {e['task']} · {e['kind']}{edited}\n\n{e['text'][:3500]}")
+            f"🗓 {e['at']} · {e['task']} · {e['kind']}{edited}\n\n📌 Правило:\n{e['text'][:2000]}{source}")
     return text, Kb([
         [Btn("✏️ Редагувати", callback_data=f"mem:w:{did}:{pid}:{eid}"),
          Btn("🗑 Видалити", callback_data=f"mem:d:{did}:{pid}:{eid}")],
@@ -1060,6 +1146,22 @@ async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         text, kb = memory_project_view(did, pid)
         await query.message.reply_text(text, reply_markup=kb)
         return
+    elif action == "r" and pid:
+        await query.answer("Формулюю висновки…")
+        context.application.create_task(consolidate_memory(query.message.chat_id, did, pid, uid, context))
+        return
+    elif action == "rs" and pid:
+        pv = st.mem_preview
+        if not pv or pv[:2] != (did, pid):
+            text, kb = memory_project_view(did, pid)
+            text = "Попередній перегляд застарів, зроби висновки ще раз.\n\n" + text
+        else:
+            n_before = len(MEMORY.entries(did, pid))
+            MEMORY.replace(did, pid, pv[2], uid, f"зведено з {n_before} записів")
+            st.mem_preview = None
+            log.info("Адмін звів пам'ять %s:%s: %s -> %s", did, pid, n_before, len(pv[2]))
+            text, kb = memory_project_view(did, pid)
+            text = f"✅ Пам'ять оновлено: {n_before} записів → {len(pv[2])} правил.\n\n" + text
     elif action == "d" and eid:
         text = "🗑 Видалити цей запис? Бот перестане його враховувати."
         kb = Kb([[Btn("Так, видалити", callback_data=f"mem:dd:{did}:{pid}:{eid}"),
@@ -1083,6 +1185,36 @@ async def on_memory(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
     await query.answer()
     await query.edit_message_text(text, reply_markup=kb)
+
+
+async def consolidate_memory(chat_id: int, did: str, pid: str, uid: int, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Зводить усі записи пам'яті проєкту в список правил і показує попередній перегляд."""
+    items = MEMORY.entries(did, pid)
+    name = _project_name(did, pid)
+    status = await context.bot.send_message(chat_id, f"🧠 Формулюю висновки для {name} з {len(items)} записів…")
+    lines = []
+    for e in items:
+        src = f" (коментар: {' '.join(e['source'].split())[:400]})" if e.get("source") else ""
+        lines.append(f"- [{e['kind']} · {e['task']}] {' '.join(e['text'].split())[:700]}{src}")
+    project = name.split(" · ")[-1]
+    try:
+        msg = await ask_claude([{"type": "text", "text": CONSOLIDATE_SYSTEM.format(project=project)}],
+                               [{"role": "user", "content": "Записи пам'яті:\n" + "\n".join(lines)}], effort="low")
+        rules = parse_rules("".join(b.text for b in msg.content if b.type == "text"), 25)
+    except Exception as exc:  # noqa: BLE001
+        log.exception("Не вдалося звести пам'ять")
+        await status.edit_text(describe_error(exc))
+        return
+    state(uid).mem_preview = (did, pid, rules)
+    preview = "\n".join(f"{i}. {r}" for i, r in enumerate(rules, 1)) or "(правил не вийшло — пам'ять стане порожньою)"
+    text = (f"🧠 {name}: замість {len(items)} записів пропоную {len(rules)} правил:\n\n{preview}\n\n"
+            "Зберегти? Старі записи буде замінено цим списком.")
+    if len(text) > 4000:
+        text = text[:3990] + "…"
+    await status.edit_text(text, reply_markup=Kb([[
+        Btn("✅ Зберегти", callback_data=f"mem:rs:{did}:{pid}"),
+        Btn("Скасувати", callback_data=f"mem:v:{did}:{pid}"),
+    ]]))
 
 
 async def apply_memory_edit(update: Update, st: "UserState", text: str) -> None:
@@ -1305,10 +1437,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if st.feedback_for:
         did, pid, task_name = st.feedback_for
         st.feedback_for = None
-        MEMORY.add(did, pid, "відгук", task_name, text, uid)
         MEMORY.mark_feedback(did, pid, uid)
         log.info("Відгук по %s:%s від %s", did, pid, uid)
-        await msg.reply_text("Дякую за відгук! Запам'ятав і врахую в наступних текстах ✅")
+        try:
+            await context.bot.send_chat_action(msg.chat_id, ChatAction.TYPING)
+        except TelegramError:
+            pass
+        about = st.session.last_result if st.session else ""
+        rules = await learn_from_comment(did, pid, "відгук", task_name, text, about, uid)
+        await msg.reply_text("Дякую за відгук! ✅\n\n" + learned_text(did, pid, rules, "відгук"))
         await msg.reply_text(DONE_TEXT, reply_markup=done_kb())
         return
     sess = st.session
@@ -1352,8 +1489,12 @@ async def _flush_after(uid: int, chat_id: int, context: ContextTypes.DEFAULT_TYP
                 "що саме змінити і як.",
             )
             return
-        MEMORY.add(sess.direction, sess.project, "правка", sess.leaf.name, text, uid)
-        text = "✏️ Правки до тексту:\n" + text
+        comment, about = text, sess.last_result
+        await _locked_turn(uid, chat_id, reply_to, sess, "✏️ Правки до тексту:\n" + text, context)
+        # Після нової версії тексту — висновки з правки в пам'ять проєкту.
+        rules = await learn_from_comment(sess.direction, sess.project, "правка", sess.leaf.name, comment, about, uid)
+        await context.bot.send_message(chat_id, learned_text(sess.direction, sess.project, rules, "правка"))
+        return
     await _locked_turn(uid, chat_id, reply_to, sess, text, context)
 
 
