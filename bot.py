@@ -20,6 +20,8 @@ import re
 import secrets
 import sys
 import time
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -498,6 +500,58 @@ class MemoryStore:
 MEMORY = MemoryStore(DATA_DIR / "memory.json")
 
 
+# ---------------------------------------------------------------------------
+# Статистика: хто й скільки текстів пише (data/stats.jsonl)
+# ---------------------------------------------------------------------------
+
+try:
+    KYIV = ZoneInfo("Europe/Kyiv")
+except Exception:  # noqa: BLE001 — немає бази часових поясів
+    KYIV = timezone.utc
+
+STATS_PERIODS = [(1, "день"), (3, "3 дні"), (7, "7 днів"), (30, "місяць")]
+
+
+class StatsStore:
+    """Події: text — бот видав першу версію тексту, fix — правка, take — «Беру в роботу»."""
+
+    def __init__(self, path: Path):
+        self.path = path
+        self.names_path = path.with_name("stats_names.json")
+        self.names: dict[str, str] = {}
+        if self.names_path.exists():
+            self.names = json.loads(self.names_path.read_text(encoding="utf-8"))
+
+    def log(self, uid: int, ev: str, did: str, pid: str, task: str) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"t": int(time.time()), "uid": uid, "ev": ev, "d": did, "p": pid, "task": task}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    def seen(self, uid: int, name: str | None) -> None:
+        """Запам'ятовує ім'я з Telegram, щоб показувати в статистиці й тих, кого немає в списку команди (адмінів)."""
+        if name and self.names.get(str(uid)) != name:
+            self.names[str(uid)] = name
+            self.names_path.parent.mkdir(parents=True, exist_ok=True)
+            self.names_path.write_text(json.dumps(self.names, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def events(self, since: float) -> list[dict]:
+        if not self.path.exists():
+            return []
+        out = []
+        for line in self.path.read_text(encoding="utf-8").splitlines():
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if rec.get("t", 0) >= since:
+                out.append(rec)
+        return out
+
+
+STATS = StatsStore(DATA_DIR / "stats.jsonl")
+
+
 LEARN_SYSTEM = """\
 Ти ведеш пам'ять проєкту {project} у боті агенції. Копірайтер дав коментар до конкретного тексту. \
 Витягни з коментаря загальні правила, які варто застосовувати в майбутніх текстах цього проєкту.
@@ -787,7 +841,8 @@ ADMIN_HELP = (
     "\n\n🔑 Ти адміністратор.\n"
     "/users — команда: картки з телефонами, блокування й розблокування\n"
     "/add ID Ім'я — запросити людину за Telegram ID\n"
-    "/memory — пам'ять проєктів: правила, які бот вивів із правок і відгуків"
+    "/memory — пам'ять проєктів: правила, які бот вивів із правок і відгуків\n"
+    "/stats — статистика: хто й скільки текстів пише"
 )
 
 
@@ -802,6 +857,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     msg = update.message
     uid = user.id
+    if ACCESS.is_allowed(uid):
+        STATS.seen(uid, user.full_name)
 
     if ACCESS.is_blocked(uid) and not ACCESS.is_admin(uid):
         await msg.reply_text("⛔ Доступ заборонено.")
@@ -1234,6 +1291,138 @@ async def apply_memory_edit(update: Update, st: "UserState", text: str) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Адмін: /stats — хто й скільки текстів пише
+# ---------------------------------------------------------------------------
+
+def plural(n: int, one: str, few: str, many: str) -> str:
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _member_name(uid: int) -> str:
+    info = ACCESS.approved.get(str(uid)) or {}
+    return info.get("name") or STATS.names.get(str(uid)) or f"ID {uid}"
+
+
+def _members(events: list[dict]) -> list[int]:
+    """Уся команда: підтверджені люди, адміни й усі, хто траплявся в статистиці."""
+    ids = {int(u) for u in ACCESS.approved} | set(ADMIN_IDS) | {e["uid"] for e in events}
+    return sorted(ids)
+
+
+def _project_label(did: str, pid: str) -> str:
+    d, p, _ = lookup(did, pid)
+    if p is None:
+        return pid
+    return p.name if did == "smm" else f"{p.name} ({d.name})"
+
+
+def _fmt_time(ts: float) -> str:
+    return datetime.fromtimestamp(ts, KYIV).strftime("%d.%m %H:%M")
+
+
+def stats_kb(current: int | None = None) -> Kb:
+    row = [Btn(("• " if days == current else "") + label.capitalize(), callback_data=f"st:{days}")
+           for days, label in STATS_PERIODS]
+    rows = [row[:2], row[2:]]
+    if current is not None:
+        rows.append([Btn("← Зведення", callback_data="st:sum")])
+    return Kb(rows)
+
+
+def stats_summary_view(now: float | None = None) -> tuple[str, Kb]:
+    now = now or time.time()
+    events = STATS.events(now - 30 * 86400)
+    texts = [e for e in events if e["ev"] == "text"]
+    rows = []
+    for uid in _members(events):
+        counts = [sum(1 for e in texts if e["uid"] == uid and e["t"] >= now - days * 86400) for days, _ in STATS_PERIODS]
+        rows.append((counts[-1], counts[-2], _member_name(uid), counts))
+    rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
+    totals = [sum(r[3][i] for r in rows) for i in range(len(STATS_PERIODS))]
+    lines = ["📊 Тексти по команді", "день · 3 дні · 7 днів · місяць", ""]
+    lines += [f"{name} — {' · '.join(map(str, counts))}" for _, _, name, counts in rows]
+    lines += ["", f"Разом — {' · '.join(map(str, totals))}", "",
+              "Тисни на період, щоб побачити деталі: скільки взято в роботу, правки й проєкти."]
+    text = "\n".join(lines)
+    return (text[:3990] + "…" if len(text) > 4000 else text), stats_kb()
+
+
+def stats_period_view(days: int, now: float | None = None) -> tuple[str, Kb]:
+    now = now or time.time()
+    since = now - days * 86400
+    events = STATS.events(since)
+    all_events = STATS.events(0)
+    last_seen: dict[int, float] = {}
+    for e in all_events:
+        last_seen[e["uid"]] = max(last_seen.get(e["uid"], 0), e["t"])
+    label = dict(STATS_PERIODS)[days]
+    lines = [f"📊 За {label} (з {_fmt_time(since)})", ""]
+    active, idle = [], []
+    for uid in _members(all_events):
+        mine = [e for e in events if e["uid"] == uid]
+        n_text = sum(1 for e in mine if e["ev"] == "text")
+        if not n_text:
+            idle.append(_member_name(uid))
+            continue
+        n_take = sum(1 for e in mine if e["ev"] == "take")
+        n_fix = sum(1 for e in mine if e["ev"] == "fix")
+        projects: dict[str, int] = {}
+        for e in mine:
+            if e["ev"] == "text":
+                key = _project_label(e["d"], e["p"])
+                projects[key] = projects.get(key, 0) + 1
+        proj = " · ".join(f"{k} {v}" for k, v in sorted(projects.items(), key=lambda kv: -kv[1]))
+        active.append((n_text, _member_name(uid), n_take, n_fix, proj, last_seen.get(uid)))
+    active.sort(key=lambda r: (-r[0], r[1]))
+    for i, (n_text, name, n_take, n_fix, proj, seen) in enumerate(active, 1):
+        lines.append(f"{i}. {name} — {n_text} {plural(n_text, 'текст', 'тексти', 'текстів')}")
+        lines.append(f"   ✅ {n_take} взято в роботу · ✏️ {n_fix} {plural(n_fix, 'правка', 'правки', 'правок')}")
+        lines.append(f"   📁 {proj}")
+        if seen:
+            lines.append(f"   🕒 востаннє: {_fmt_time(seen)}")
+    if not active:
+        lines.append("За цей період текстів ще не було.")
+    if idle:
+        lines += ["", "😴 Без текстів: " + ", ".join(sorted(idle))]
+    t_text = sum(r[0] for r in active)
+    lines += ["", f"Разом: {t_text} {plural(t_text, 'текст', 'тексти', 'текстів')} · "
+                  f"✅ {sum(r[2] for r in active)} · ✏️ {sum(r[3] for r in active)}"]
+    text = "\n".join(lines)
+    return (text[:3990] + "…" if len(text) > 4000 else text), stats_kb(days)
+
+
+async def cmd_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ACCESS.is_admin(update.effective_user.id):
+        return
+    text, kb = stats_summary_view()
+    await update.message.reply_text(text, reply_markup=kb)
+
+
+async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not ACCESS.is_admin(query.from_user.id):
+        await query.answer("Лише для адміністратора.")
+        return
+    arg = query.data.split(":")[1]
+    if arg == "sum":
+        text, kb = stats_summary_view()
+    elif arg.isdigit() and int(arg) in dict(STATS_PERIODS):
+        text, kb = stats_period_view(int(arg))
+    else:
+        await query.answer()
+        return
+    await query.answer()
+    try:
+        await query.edit_message_text(text, reply_markup=kb)
+    except TelegramError:
+        pass  # той самий текст — Telegram не дає «змінити» на ідентичне
+
+
+# ---------------------------------------------------------------------------
 # Меню
 # ---------------------------------------------------------------------------
 
@@ -1334,6 +1523,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             return
         await query.answer("Текст твій ✅")
         sess.done = True
+        STATS.log(uid, "take", sess.direction, sess.project, sess.leaf.name)
         try:
             await query.edit_message_reply_markup(reply_markup=None)
         except TelegramError:
@@ -1428,6 +1618,7 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     if not ACCESS.is_allowed(uid):
         return  # чужим — тиша
+    STATS.seen(uid, update.effective_user.full_name)
     if not text:
         return
     st = state(uid)
@@ -1490,6 +1681,7 @@ async def _flush_after(uid: int, chat_id: int, context: ContextTypes.DEFAULT_TYP
             )
             return
         comment, about = text, sess.last_result
+        STATS.log(uid, "fix", sess.direction, sess.project, sess.leaf.name)
         await _locked_turn(uid, chat_id, reply_to, sess, "✏️ Правки до тексту:\n" + text, context)
         # Після нової версії тексту — висновки з правки в пам'ять проєкту.
         rules = await learn_from_comment(sess.direction, sess.project, "правка", sess.leaf.name, comment, about, uid)
@@ -1570,6 +1762,8 @@ async def run_turn(
     if not is_question:
         sess.attempts += 1
         sess.last_result = result
+        if sess.attempts == 1:
+            STATS.log(chat_id, "text", sess.direction, sess.project, sess.leaf.name)
         if sess.result_msg:  # кнопки лишаються тільки під останньою версією
             try:
                 await context.bot.edit_message_reply_markup(
@@ -1604,6 +1798,7 @@ ADMIN_COMMANDS = USER_COMMANDS + [
     BotCommand("users", "Команда: телефони, блокування"),
     BotCommand("add", "Запросити людину: /add ID Ім'я"),
     BotCommand("memory", "Пам'ять проєктів: правки й правила"),
+    BotCommand("stats", "Статистика: хто й скільки текстів пише"),
 ]
 
 
@@ -1631,6 +1826,8 @@ def build_app() -> Application:
     app.add_handler(CallbackQueryHandler(on_access_decision, pattern=r"^acc:(ok|no):\d+$"))
     app.add_handler(CallbackQueryHandler(on_users, pattern=r"^usr:"))
     app.add_handler(CommandHandler("memory", cmd_memory, filters=private))
+    app.add_handler(CommandHandler("stats", cmd_stats, filters=private))
+    app.add_handler(CallbackQueryHandler(on_stats, pattern=r"^st:"))
     app.add_handler(CallbackQueryHandler(on_memory, pattern=r"^mem:"))
     app.add_handler(MessageHandler(private & filters.CONTACT, on_contact))
     app.add_handler(CallbackQueryHandler(on_menu))
