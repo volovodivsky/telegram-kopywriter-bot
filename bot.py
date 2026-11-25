@@ -131,6 +131,10 @@ class Task:
     card: bool
     brief: bool = False  # показувати на старті список «що надіслати» з проєкту
     variants: dict[str, "Task"] = field(default_factory=dict)  # підваріанти (Статика / Reels)
+    projects: list[str] | None = None  # якщо задано — задача є лише в цих проєктах
+
+    def available_for(self, pid: str) -> bool:
+        return not self.projects or pid in self.projects
 
 
 @dataclass
@@ -168,7 +172,7 @@ def load_menu() -> dict[str, Direction]:
         for t in d.get("tasks", []):
             tid = _check_id(t["id"], f"{did} → задача")
             task = Task(tid, t["name"], t["name"], load_skill(t.get("skill")), t.get("hint", ""),
-                        bool(t.get("card")), bool(t.get("brief")))
+                        bool(t.get("card")), bool(t.get("brief")), projects=t.get("projects"))
             for v in t.get("variants") or []:
                 vid = _check_id(v["id"], f"{did} → {tid} → варіант")
                 task.variants[vid] = Task(
@@ -723,7 +727,7 @@ def projects_kb(d: Direction) -> Kb:
 
 
 def tasks_kb(d: Direction, p: Project) -> Kb:
-    rows = [[Btn(t.button, callback_data=f"t:{d.id}:{p.id}:{t.id}")] for t in d.tasks.values()]
+    rows = [[Btn(t.button, callback_data=f"t:{d.id}:{p.id}:{t.id}")] for t in d.tasks.values() if t.available_for(p.id)]
     rows.append([Btn("← Проєкти", callback_data=f"d:{d.id}")])
     return Kb(rows)
 
@@ -1473,7 +1477,7 @@ async def on_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
     elif parts[0] == "t" and len(parts) == 4:
         d, p, t = lookup(parts[1], parts[2], parts[3])
-        if p is None or t is None:
+        if p is None or t is None or not t.available_for(p.id):
             await query.answer("Меню застаріло, обери ще раз", show_alert=True)
             return
         await query.answer()
