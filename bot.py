@@ -258,7 +258,31 @@ class RefusedError(Exception):
     pass
 
 
-async def ask_claude(system: list[dict], history: list[dict], effort: str | None = None):
+# Ціни Anthropic, $ за 1 млн токенів: (вхід, вихід, читання кешу). Запис у кеш = 1,25 × вхід.
+PRICES = {
+    "claude-opus-5-5": (4.0, 20.0, 0.20),
+    "claude-opus-5": (5.0, 25.0, 0.50),
+    "claude-opus-4-8": (5.0, 25.0, 0.50),
+    "claude-sonnet-5-5": (2.0, 10.0, 0.20),
+    "claude-sonnet-5": (2.0, 10.0, 0.20),
+    "claude-haiku-5-5": (0.10, 0.50, 0.01),
+    "claude-fable-5-1": (10.0, 50.0, 0.25),
+}
+
+
+def cost_usd(model: str, usage) -> float:
+    """Вартість одного запиту в доларах за токенами з відповіді API."""
+    price = PRICES.get(model) or PRICES.get(CLAUDE_MODEL) or PRICES["claude-opus-5-5"]
+    inp, out, cache_read = price
+    def n(name: str) -> int:
+        return getattr(usage, name, 0) or 0
+    total = (n("input_tokens") * inp + n("cache_creation_input_tokens") * inp * 1.25
+             + n("cache_read_input_tokens") * cache_read + n("output_tokens") * out)
+    return total / 1_000_000
+
+
+async def ask_claude(system: list[dict], history: list[dict], effort: str | None = None,
+                     meta: tuple | None = None):
     """Відправляє весь діалог і повертає відповідь моделі (Message)."""
     extra: dict = {}
     if CLAUDE_MODEL in FALLBACK_MODELS:
@@ -273,11 +297,15 @@ async def ask_claude(system: list[dict], history: list[dict], effort: str | None
         **extra,
     ) as stream:
         message = await stream.get_final_message()
+    usd = cost_usd(getattr(message, "model", CLAUDE_MODEL), message.usage)
     log.info(
-        "Claude: in=%s out=%s cache_read=%s stop=%s",
+        "Claude: in=%s out=%s cache_read=%s stop=%s cost=$%.4f",
         message.usage.input_tokens, message.usage.output_tokens,
-        message.usage.cache_read_input_tokens, message.stop_reason,
+        message.usage.cache_read_input_tokens, message.stop_reason, usd,
     )
+    if meta:  # (uid, напрям, проєкт, задача, вид запиту) — для статистики витрат
+        uid, did, pid, task, kind = meta
+        STATS.log_cost(uid, did, pid, task, kind, usd)
     if message.stop_reason == "refusal":
         raise RefusedError()
     return message
@@ -532,6 +560,13 @@ class StatsStore:
         with self.path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
 
+    def log_cost(self, uid: int, did: str, pid: str, task: str, kind: str, usd: float) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        rec = {"t": int(time.time()), "uid": uid, "ev": "cost", "d": did, "p": pid, "task": task,
+               "kind": kind, "usd": round(usd, 6)}
+        with self.path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
     def seen(self, uid: int, name: str | None) -> None:
         """Запам'ятовує ім'я з Telegram, щоб показувати в статистиці й тих, кого немає в списку команди (адмінів)."""
         if name and self.names.get(str(uid)) != name:
@@ -604,7 +639,8 @@ async def learn_from_comment(did: str, pid: str, kind: str, task: str, comment: 
             f"Коментар копірайтера ({kind}):\n<comment>\n{comment}\n</comment>\n\nВже в пам'яті:\n{existing}")
     try:
         msg = await ask_claude([{"type": "text", "text": LEARN_SYSTEM.format(project=project)}],
-                               [{"role": "user", "content": user}], effort="low")
+                               [{"role": "user", "content": user}], effort="low",
+                               meta=(uid, did, pid, task, "learn"))
         rules = parse_rules("".join(b.text for b in msg.content if b.type == "text"), 3)
     except Exception:  # noqa: BLE001
         log.exception("Не вдалося сформулювати висновки")
@@ -688,6 +724,7 @@ class UserState:
     feedback_for: tuple[str, str, str] | None = None  # (напрям, проєкт, задача) — чекаємо відгук
     mem_edit: tuple[str, str, str | None] | None = None  # адмін редагує пам'ять: (напрям, проєкт, id або None = новий)
     mem_preview: tuple[str, str, list[str]] | None = None  # зведені правила, що чекають «Зберегти»
+    balance_wait: bool = False  # адмін має надіслати залишок балансу для прогнозу
 
 
 STATE: dict[int, UserState] = {}
@@ -1262,7 +1299,8 @@ async def consolidate_memory(chat_id: int, did: str, pid: str, uid: int, context
     project = name.split(" · ")[-1]
     try:
         msg = await ask_claude([{"type": "text", "text": CONSOLIDATE_SYSTEM.format(project=project)}],
-                               [{"role": "user", "content": "Записи пам'яті:\n" + "\n".join(lines)}], effort="low")
+                               [{"role": "user", "content": "Записи пам'яті:\n" + "\n".join(lines)}], effort="low",
+                               meta=(uid, did, pid, "усі задачі", "consolidate"))
         rules = parse_rules("".join(b.text for b in msg.content if b.type == "text"), 25)
     except Exception as exc:  # noqa: BLE001
         log.exception("Не вдалося звести пам'ять")
@@ -1330,13 +1368,59 @@ def _fmt_time(ts: float) -> str:
     return datetime.fromtimestamp(ts, KYIV).strftime("%d.%m %H:%M")
 
 
+def money(x: float) -> str:
+    return f"${x:.2f}"
+
+
 def stats_kb(current: int | None = None) -> Kb:
     row = [Btn(("• " if days == current else "") + label.capitalize(), callback_data=f"st:{days}")
            for days, label in STATS_PERIODS]
-    rows = [row[:2], row[2:]]
+    rows = [row[:2], row[2:], [Btn("💰 Прогноз балансу", callback_data="st:bal")]]
     if current is not None:
         rows.append([Btn("← Зведення", callback_data="st:sum")])
     return Kb(rows)
+
+
+def _spend(events: list[dict], since: float) -> float:
+    return sum(e.get("usd", 0) for e in events if e["ev"] == "cost" and e["t"] >= since)
+
+
+def forecast_text(balance: float, now: float | None = None) -> str:
+    """На скільки текстів і днів вистачить балансу за темпом останніх (до 7) днів."""
+    now = now or time.time()
+    events = STATS.events(0)
+    costs = [e for e in events if e["ev"] == "cost"]
+    if not costs:
+        return ("💰 Даних про витрати ще немає: бот почав їх рахувати щойно. "
+                "Попрацюйте кілька днів і спробуй ще раз.")
+    first = min(e["t"] for e in costs)
+    span = min(7.0, max((now - first) / 86400, 1 / 24))
+    since = now - span * 86400
+    spent = _spend(events, since)
+    texts = sum(1 for e in events if e["ev"] == "text" and e["t"] >= since)
+    per_day = spent / span
+    lines = [f"💰 Баланс: {money(balance)}", ""]
+    period = f"{span:.1f} дн." if span < 7 else "7 днів"
+    lines.append(f"За останні {period}: витрачено {money(spent)}, написано {texts} "
+                 f"{plural(texts, 'текст', 'тексти', 'текстів')}.")
+    if texts:
+        per_text = spent / texts
+        lines.append(f"• Середній текст (з правками й пам'яттю): {money(per_text)}")
+    lines.append(f"• Темп: {money(per_day)} на день")
+    lines.append("")
+    parts = []
+    if texts and spent > 0:
+        parts.append(f"≈ {int(balance / (spent / texts))} текстів")
+    if per_day > 0:
+        days_left = balance / per_day
+        until = datetime.fromtimestamp(now + days_left * 86400, KYIV).strftime("%d.%m")
+        parts.append(f"≈ {days_left:.0f} днів (приблизно до {until})")
+    lines.append("Вистачить на: " + (" або ".join(parts) if parts else "не вдалося порахувати"))
+    if span < 1:
+        lines += ["", "⚠️ Даних менше доби, тож прогноз дуже приблизний."]
+    elif span < 7:
+        lines += ["", f"ℹ️ Прогноз за {span:.0f} дн. даних; точнішим він стане через тиждень роботи."]
+    return "\n".join(lines)
 
 
 def stats_summary_view(now: float | None = None) -> tuple[str, Kb]:
@@ -1349,10 +1433,16 @@ def stats_summary_view(now: float | None = None) -> tuple[str, Kb]:
         rows.append((counts[-1], counts[-2], _member_name(uid), counts))
     rows.sort(key=lambda r: (-r[0], -r[1], r[2]))
     totals = [sum(r[3][i] for r in rows) for i in range(len(STATS_PERIODS))]
+    spend = [_spend(events, now - days * 86400) for days, _ in STATS_PERIODS]
     lines = ["📊 Тексти по команді", "день · 3 дні · 7 днів · місяць", ""]
     lines += [f"{name} — {' · '.join(map(str, counts))}" for _, _, name, counts in rows]
-    lines += ["", f"Разом — {' · '.join(map(str, totals))}", "",
-              "Тисни на період, щоб побачити деталі: скільки взято в роботу, правки й проєкти."]
+    lines += ["", f"Разом — {' · '.join(map(str, totals))}",
+              f"💵 Витрати — {' · '.join(money(x) for x in spend)}"]
+    week_texts = totals[2]
+    if week_texts:
+        lines.append(f"Середній текст за 7 днів: {money(spend[2] / week_texts)}")
+    lines += ["", "Тисни на період, щоб побачити деталі: взято в роботу, правки, проєкти й витрати. "
+              "«💰 Прогноз балансу» покаже, на скільки вистачить коштів."]
     text = "\n".join(lines)
     return (text[:3990] + "…" if len(text) > 4000 else text), stats_kb()
 
@@ -1382,10 +1472,11 @@ def stats_period_view(days: int, now: float | None = None) -> tuple[str, Kb]:
                 key = _project_label(e["d"], e["p"])
                 projects[key] = projects.get(key, 0) + 1
         proj = " · ".join(f"{k} {v}" for k, v in sorted(projects.items(), key=lambda kv: -kv[1]))
-        active.append((n_text, _member_name(uid), n_take, n_fix, proj, last_seen.get(uid)))
+        usd = sum(e.get("usd", 0) for e in mine if e["ev"] == "cost")
+        active.append((n_text, _member_name(uid), n_take, n_fix, proj, last_seen.get(uid), usd))
     active.sort(key=lambda r: (-r[0], r[1]))
-    for i, (n_text, name, n_take, n_fix, proj, seen) in enumerate(active, 1):
-        lines.append(f"{i}. {name} — {n_text} {plural(n_text, 'текст', 'тексти', 'текстів')}")
+    for i, (n_text, name, n_take, n_fix, proj, seen, usd) in enumerate(active, 1):
+        lines.append(f"{i}. {name} — {n_text} {plural(n_text, 'текст', 'тексти', 'текстів')} · 💵 {money(usd)}")
         lines.append(f"   ✅ {n_take} взято в роботу · ✏️ {n_fix} {plural(n_fix, 'правка', 'правки', 'правок')}")
         lines.append(f"   📁 {proj}")
         if seen:
@@ -1395,8 +1486,19 @@ def stats_period_view(days: int, now: float | None = None) -> tuple[str, Kb]:
     if idle:
         lines += ["", "😴 Без текстів: " + ", ".join(sorted(idle))]
     t_text = sum(r[0] for r in active)
+    spent = _spend(events, since)
+    by_proj: dict[str, float] = {}
+    for e in events:
+        if e["ev"] == "cost":
+            key = _project_label(e["d"], e["p"])
+            by_proj[key] = by_proj.get(key, 0) + e.get("usd", 0)
+    if by_proj:
+        lines += ["", "💵 По проєктах: " + " · ".join(
+            f"{k} {money(v)}" for k, v in sorted(by_proj.items(), key=lambda kv: -kv[1]))]
     lines += ["", f"Разом: {t_text} {plural(t_text, 'текст', 'тексти', 'текстів')} · "
-                  f"✅ {sum(r[2] for r in active)} · ✏️ {sum(r[3] for r in active)}"]
+                  f"✅ {sum(r[2] for r in active)} · ✏️ {sum(r[3] for r in active)} · 💵 {money(spent)}"]
+    if t_text:
+        lines.append(f"Середній текст: {money(spent / t_text)}")
     text = "\n".join(lines)
     return (text[:3990] + "…" if len(text) > 4000 else text), stats_kb(days)
 
@@ -1414,6 +1516,14 @@ async def on_stats(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await query.answer("Лише для адміністратора.")
         return
     arg = query.data.split(":")[1]
+    if arg == "bal":
+        state(query.from_user.id).balance_wait = True
+        await query.answer()
+        await query.message.reply_text(
+            "💰 Надішли залишок балансу Anthropic у доларах, наприклад 18.50.\n"
+            "Його видно тут: https://console.anthropic.com/settings/billing"
+        )
+        return
     if arg == "sum":
         text, kb = stats_summary_view()
     elif arg.isdigit() and int(arg) in dict(STATS_PERIODS):
@@ -1628,6 +1738,15 @@ async def on_text(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not text:
         return
     st = state(uid)
+    if st.balance_wait and ACCESS.is_admin(uid):
+        st.balance_wait = False
+        try:
+            balance = float(text.replace("$", "").replace(",", ".").replace(" ", ""))
+        except ValueError:
+            await msg.reply_text("Не схоже на суму. Тисни «💰 Прогноз балансу» ще раз і надішли число, наприклад 18.50.")
+            return
+        await msg.reply_text(forecast_text(balance))
+        return
     if st.mem_edit and ACCESS.is_admin(uid):
         await apply_memory_edit(update, st, text)
         return
@@ -1737,7 +1856,8 @@ async def run_turn(
     typing = context.application.create_task(_keep_typing(context, chat_id))
     sess.history.append({"role": "user", "content": user_text})
     try:
-        message = await ask_claude(sess.system, sess.history)
+        message = await ask_claude(sess.system, sess.history,
+                                   meta=(chat_id, sess.direction, sess.project, sess.leaf.name, "text"))
     except Exception as exc:  # noqa: BLE001
         sess.history.pop()  # прибираємо репліку, на яку не вийшло відповісти
         if isinstance(exc, (RefusedError, anthropic.APIError)):
