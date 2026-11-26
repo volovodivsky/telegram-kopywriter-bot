@@ -86,7 +86,7 @@ COLLECT_WINDOW_SEC = 2.5
 MAX_HISTORY = 30
 # Скільки разів бот може видати текст в одній сесії (перша версія + правки).
 # Уточнювальні питання бота й «Картка оцінки» не рахуються.
-MAX_ATTEMPTS = int(os.getenv("BOT_MAX_ATTEMPTS", "2"))
+MAX_ATTEMPTS = int(os.getenv("BOT_MAX_ATTEMPTS", "3"))
 # Так бот позначає відповідь, у якій лише питання (без тексту).
 QUESTION_MARK = "❓"
 # Мінімум слів у правках, щоб бот їх прийняв.
@@ -747,7 +747,9 @@ def task_hint(p: Project, leaf: Task) -> str:
         lines += ["", "Якщо якийсь пункт не потрібен, напиши «цього не треба». Поки всіх відповідей немає, текст я не пишу."]
     else:
         lines = [f"📝 {leaf.hint}"] if leaf.hint else []
-    lines += ["", f"🔁 На один текст — {MAX_ATTEMPTS} спроби: перша версія й правка. Тож одразу давай максимум деталей 😉"]
+    fixes = MAX_ATTEMPTS - 1
+    lines += ["", f"🔁 На один текст — {MAX_ATTEMPTS} {plural(MAX_ATTEMPTS, 'спроба', 'спроби', 'спроб')}: перша версія "
+                  f"й {fixes} {plural(fixes, 'правка', 'правки', 'правок')}. Тож одразу давай максимум деталей 😉"]
     return "\n".join(lines).strip()
 
 
